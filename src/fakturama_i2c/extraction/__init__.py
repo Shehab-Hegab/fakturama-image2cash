@@ -1,0 +1,1 @@
+"""Extraction layer: OCR + Vision LLM -> validated pydantic models."""

@@ -1,0 +1,1 @@
+"""Utility package: errors, logging, screenshots, filesystem helpers."""

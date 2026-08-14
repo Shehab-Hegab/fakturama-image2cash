@@ -1,0 +1,1 @@
+"""UI automation layer: UIA control discovery, waits, element abstractions."""
