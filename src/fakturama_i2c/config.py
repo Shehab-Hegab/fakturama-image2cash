@@ -53,7 +53,7 @@ class Settings:
 
     # -- Extraction ----------------------------------------------------------
     ocr_engine: str = "mock"                    # "mock" | "tesseract" | "easyocr"
-    llm_provider: str = "mock"                  # "mock" | "openai" | "groq" | "anthropic"
+    llm_provider: str = "mock"                  # mock|openai|groq|together|openrouter|ollama|vllm|anthropic
     llm_base_url: str = ""                      # for OpenAI-compatible endpoints
     llm_model: str = ""
     llm_api_key: str = ""
@@ -96,7 +96,16 @@ class Settings:
             dry_run=_bool(os.getenv("I2C_DRY_RUN"), False),
             currency=os.getenv("I2C_CURRENCY", "EUR"),
         )
-        if s.llm_provider not in {"mock", "openai", "groq", "anthropic"}:
+        if s.llm_provider not in {
+            "mock",
+            "openai",
+            "groq",
+            "together",
+            "openrouter",
+            "ollama",
+            "vllm",
+            "anthropic",
+        }:
             raise ConfigError(f"unsupported llm_provider: {s.llm_provider}")
         if s.ocr_engine not in {"mock", "tesseract", "easyocr"}:
             raise ConfigError(f"unsupported ocr_engine: {s.ocr_engine}")

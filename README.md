@@ -98,9 +98,9 @@ The `.env` file drives everything via `I2C_*` variables. Key ones:
 |---|---|---|
 | `I2C_FAKTURAMA_EXE` | Path to `Fakturama.exe`; empty ⇒ attach to a running instance | *(empty)* |
 | `I2C_OCR_ENGINE` | `mock` (sidecar `.txt`), `tesseract`, `easyocr` | `mock` |
-| `I2C_LLM_PROVIDER` | `mock` (sidecar `.json`), `openai`, `groq`, `anthropic` | `mock` |
-| `I2C_LLM_API_KEY` | API key for the chosen LLM provider | *(empty)* |
-| `I2C_LLM_MODEL` / `I2C_LLM_BASE_URL` | Model name / OpenAI-compatible base URL (used by `openai`/`groq`) | *(empty)* |
+| `I2C_LLM_PROVIDER` | `mock` (sidecar `.json`), `openai`/`groq`/`together`/`openrouter`/`ollama`/`vllm` (OpenAI-compatible), `anthropic` (native) | `mock` |
+| `I2C_LLM_API_KEY` | API key for the chosen LLM provider (`ollama`/`vllm` need none) | *(empty)* |
+| `I2C_LLM_MODEL` / `I2C_LLM_BASE_URL` | Model name / OpenAI-compatible base URL (used by `openai`/`groq`/`together`/`openrouter`/`ollama`/`vllm`) | *(empty)* |
 
 With the default `mock` engines the whole pipeline runs fully offline: OCR text
 is read from `<image>.txt` and the structured result from `<image>.json` next to

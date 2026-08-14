@@ -8,8 +8,10 @@ Two providers ship:
 
 * ``mock``         -- read a sidecar ``<image>.json`` (offline/dev/tests).
 * ``openai``       -- any OpenAI-compatible ``/chat/completions`` endpoint
-                      (OpenAI, Groq, or a self-hosted gateway via
-                      ``I2C_LLM_BASE_URL``). Vision-capable model required.
+                      (OpenAI, Groq, Together, OpenRouter, or a self-hosted
+                      gateway via ``I2C_LLM_BASE_URL``). Vision-capable model
+                      required.
+* ``ollama``/``vllm`` -- local OpenAI-compatible endpoints; no API key needed.
 * ``anthropic``    -- Anthropic's native ``/v1/messages`` API (e.g. Claude
                       with vision).
 
@@ -25,7 +27,7 @@ import base64
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from ..config import Settings
 from ..models import ExtractedOrder
@@ -33,6 +35,24 @@ from ..utils.errors import ExtractionError
 from ..utils.logging import get_logger
 
 logger = get_logger("extraction.llm")
+
+
+def _ensure_ok(resp: Any) -> None:
+    """Raise a descriptive :class:`ExtractionError` for non-2xx LLM responses.
+
+    Unlike ``raise_for_status`` this surfaces the server's error body (e.g.
+    Anthropic's ``invalid_request_error``) so misconfigurations are obvious
+    instead of an opaque ``HTTPError``.
+    """
+    if resp.status_code >= 400:
+        body = (resp.text or "").strip()[:500]
+        raise ExtractionError(
+            step="extract.llm",
+            detail=(
+                f"vision LLM HTTP {resp.status_code}"
+                + (f": {body}" if body else "")
+            ),
+        )
 
 
 SYSTEM_PROMPT = """\
@@ -156,11 +176,19 @@ class OpenAiCompatibleProvider(StructuredLlm):
     on schema/validation failures up to ``settings.retry_attempts``.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, requires_key: bool = True) -> None:
         self._settings = settings
         self._base_url = (settings.llm_base_url or "https://api.openai.com/v1").rstrip("/")
         self._api_key = settings.llm_api_key or os.getenv("OPENAI_API_KEY", "")
         self._model = settings.llm_model or "gpt-4o"
+        if requires_key and not self._api_key:
+            raise ExtractionError(
+                step="extract.llm",
+                detail=(
+                    "llm_provider requires an API key: set I2C_LLM_API_KEY "
+                    "or OPENAI_API_KEY (local servers like Ollama/vLLM need none)"
+                ),
+            )
 
     def extract_order(self, image: Path, ocr_hint: str = "") -> ExtractedOrder:
         import requests  # imported lazily; requests is a runtime dependency
@@ -203,7 +231,7 @@ class OpenAiCompatibleProvider(StructuredLlm):
                     },
                     timeout=self._settings.llm_timeout,
                 )
-                resp.raise_for_status()
+                _ensure_ok(resp)
                 raw = resp.json()["choices"][0]["message"]["content"]
                 order = self._parse(raw)
                 logger.info("llm extraction ok on attempt %d", attempt)
@@ -251,6 +279,14 @@ class AnthropicProvider(StructuredLlm):
         self._base_url = (settings.llm_base_url or "https://api.anthropic.com").rstrip("/")
         self._api_key = settings.llm_api_key or os.getenv("ANTHROPIC_API_KEY", "")
         self._model = settings.llm_model or "claude-sonnet-4-20250514"
+        if not self._api_key:
+            raise ExtractionError(
+                step="extract.llm",
+                detail=(
+                    "llm_provider 'anthropic' requires an API key: set "
+                    "I2C_LLM_API_KEY or ANTHROPIC_API_KEY"
+                ),
+            )
 
     def extract_order(self, image: Path, ocr_hint: str = "") -> ExtractedOrder:
         import requests  # imported lazily; requests is a runtime dependency
@@ -296,7 +332,7 @@ class AnthropicProvider(StructuredLlm):
                     },
                     timeout=self._settings.llm_timeout,
                 )
-                resp.raise_for_status()
+                _ensure_ok(resp)
                 text = "".join(
                     block.get("text", "") for block in resp.json().get("content", [])
                 )
@@ -334,17 +370,36 @@ class AnthropicProvider(StructuredLlm):
 
 
 def get_llm_provider(settings: Settings) -> StructuredLlm:
-    """Factory for the configured vision-LLM provider."""
+    """Factory for the configured vision-LLM provider.
+
+    OpenAI-compatible providers (``openai``, ``groq``, ``together``,
+    ``openrouter``, ``ollama``, ``vllm``) all speak the same
+    ``/chat/completions`` contract; the first four need an API key while
+    local Ollama/vLLM servers do not. ``anthropic`` uses its native
+    ``/v1/messages`` API.
+    """
+    openai_compatible = {
+        "openai",
+        "groq",
+        "together",
+        "openrouter",
+        "ollama",
+        "vllm",
+    }
+    keyless = {"ollama", "vllm"}
     providers: dict[str, type[StructuredLlm]] = {
         "mock": MockLlmProvider,
-        "openai": OpenAiCompatibleProvider,
-        "groq": OpenAiCompatibleProvider,
         "anthropic": AnthropicProvider,
     }
+    for name in openai_compatible:
+        providers[name] = OpenAiCompatibleProvider
+
     cls = providers.get(settings.llm_provider)
     if cls is None:
         raise ExtractionError(
             step="extract.llm", detail=f"unknown llm_provider: {settings.llm_provider}"
         )
     logger.info("llm provider: %s", settings.llm_provider)
+    if cls is OpenAiCompatibleProvider:
+        return cls(settings, requires_key=settings.llm_provider not in keyless)
     return cls(settings)

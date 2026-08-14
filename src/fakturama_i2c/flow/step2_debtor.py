@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from ..models import DebtorData, payment_code_for
 from ..ui.elements import Button, Checkbox, Combo, Edit, List
-from ..utils.errors import ManualReviewError
+from ..utils.errors import ControlNotFoundError, ManualReviewError
 from ..utils.logging import get_logger
 from .context import (
     FlowContext,
@@ -225,3 +225,11 @@ def _fill_payment_editor(ctx: FlowContext, method: str) -> None:
     Edit(ctx.find("PAYMENT_CASH_DISCOUNT"), ctx.waits).fill("0")
     Edit(ctx.find("PAYMENT_DISCOUNT_DAYS"), ctx.waits).fill("0")
     Edit(ctx.find("PAYMENT_NET_DAYS"), ctx.waits).fill("0")
+    # Spec 2.10.5: the 'unpaid' / 'deposit' / 'paid' text fields must stay
+    # blank. New records usually default to blank; blank them explicitly so a
+    # prefilled default can never sneak a payment status into the method.
+    for role in ("PAYMENT_UNPAID_TEXT", "PAYMENT_DEPOSIT_TEXT", "PAYMENT_PAID_TEXT"):
+        try:
+            Edit(ctx.find(role), ctx.waits).clear()
+        except ControlNotFoundError:
+            logger.info("step2: payment status text %s not present (fine)", role)

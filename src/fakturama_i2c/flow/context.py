@@ -264,8 +264,14 @@ def select_combo_value(ctx: FlowContext, role: str, value: str, step: str) -> st
 
 
 def doc_kind(row: Any, kind: str) -> bool:
-    """True when the row belongs to the document kind (e.g. 'order', 'invoice')."""
-    return kind in " ".join(row).lower()
+    """True when the row belongs to the document kind (e.g. 'order', 'invoice').
+
+    Word-boundary match (never substring): ``order`` must not match a row that
+    merely contains 'order' inside another word, and ``paid`` must not match
+    ``unpaid``.
+    """
+    text = " ".join(str(c) for c in row).lower()
+    return re.search(r"(?<![a-z])" + re.escape(kind.lower()) + r"(?![a-z])", text) is not None
 
 
 def doc_total_ok(row: Any, total: Decimal) -> bool:
