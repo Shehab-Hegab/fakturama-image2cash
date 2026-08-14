@@ -59,12 +59,26 @@ class Control:
 
     @property
     def ctrl(self) -> Any:
-        if not self._ctrl.exists(timeout=0.5):
+        if not _alive(self._ctrl):
             raise ControlNotFoundError("underlying control vanished", "")
         return self._ctrl
 
     def screenshot(self) -> Any:
         return self.ctrl.capture_as_image()
+
+
+def _alive(control: Any) -> bool:
+    """Backend-agnostic liveness check (UIA wrappers have no ``exists()``)."""
+    check = getattr(control, "exists", None)
+    if callable(check):
+        try:
+            return bool(check(timeout=0.5))
+        except Exception:
+            return True
+    try:
+        return bool(control.is_visible())
+    except Exception:
+        return True
 
 
 class Edit(Control):
@@ -108,6 +122,14 @@ class Combo(Control):
             return self.items()[0] if self.items() else ""
 
     def select(self, text: str) -> None:
+        # SWT ComboBoxes expose no reliable item list via UIA texts()/items()
+        # (item_count() can differ from texts()); try the direct UIA select
+        # first, fall back to an items-based exact match, then manual review.
+        try:
+            self.ctrl.select(str(text))
+            return
+        except Exception:
+            pass
         items = self.items()
         exact = [i for i in items if (i or "").strip().lower() == (text or "").strip().lower()]
         if not exact:

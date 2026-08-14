@@ -45,12 +45,19 @@ class Strategy:
     ancestor_kind: str = "name"
     # When >1 control matches this strategy, treat as ambiguity => manual review
     require_unique: bool = True
+    # Extra exact (case-insensitive) name filter, combined with kind. Used to
+    # disambiguate same-type controls (e.g. the VAT-mode ComboBox named 'VAT'
+    # vs the totals VAT Edit / Shipping ComboBox) without a full name strategy.
+    name_filter: Optional[str] = None
 
     def to_child_window_kwargs(self) -> dict[str, Any]:
         if self.kind == "auto_id":
             return {"auto_id": self.value}
         if self.kind == "control_type":
-            return {"control_type": self.value}
+            kwargs = {"control_type": self.value}
+            if self.name_filter:
+                kwargs["name"] = self.name_filter
+            return kwargs
         if self.kind == "name":
             if self.regex:
                 return {"title_re": self.value}
@@ -103,17 +110,30 @@ def default_registry() -> dict[str, Role]:
         # auto_ids are per-instance SWT ids (strongest when present); name
         # strategies remain the cross-session fallback chain.
         "ORDER_DATE": Role("ORDER_DATE").add(
-            Strategy("auto_id", "1246152"),
+            Strategy("auto_id", "5046524"),
         ).add(Strategy("name", "Date", regex=True)),
         "ORDER_REFERENCE": Role("ORDER_REFERENCE").add(
-            Strategy("auto_id", "2295810"),
+            Strategy("auto_id", "133892"),
         ).add(Strategy("name", "Cust.Ref.", regex=True)).add(Strategy("name", "Ref.", regex=True)),
+        # Price-mode ComboBox has NO name; it is the first ComboBox in the
+        # New Order editor (before the VAT-mode ComboBox and the Shipping
+        # ComboBox). require_unique=False picks matches[0] = the price-mode box.
         "ORDER_PRICE_MODE": Role("ORDER_PRICE_MODE").add(
-            Strategy("auto_id", "9044880"),
-        ).add(Strategy("name", "Price", regex=True)),
+            Strategy("auto_id", "133914"),
+        ).add(Strategy("control_type", "ComboBox", require_unique=False)).add(
+            Strategy("name", "Price", regex=True)
+        ),
+        # VAT-mode ComboBox is the only ComboBox named 'VAT' (the totals VAT
+        # field is an Edit, the Shipping box is named 'Shipping'). NOTE: do NOT
+        # add a bare name 'VAT' fallback -- it matches the totals-VAT Edit and
+        # Combo.select would then write into a text field. ComboBox-scoped
+        # strategies only; if the box is not exposed (lazy SWT rendering) the
+        # role raises ControlNotFoundError, which the flow surfaces honestly.
         "ORDER_VAT_MODE": Role("ORDER_VAT_MODE").add(
-            Strategy("auto_id", "1249396"),
-        ).add(Strategy("name", "VAT", regex=True)),
+            Strategy("control_type", "ComboBox", name_filter="VAT"),
+        ).add(Strategy("auto_id", "134134")).add(
+            Strategy("control_type", "ComboBox", require_unique=False)
+        ),
         # The UPPER icon (existing contact) beside the Addresses section.
         # Distinct from the LOWER green "+" (new debtor) via ancestor scope
         # and name (tooltip). Order matters: the strongest signal first.
@@ -287,20 +307,24 @@ def default_registry() -> dict[str, Role]:
             Strategy("control_type", "Table"),
         ).add(Strategy("class", "SWT.Table")),
         "ORDER_DISCOUNT": Role("ORDER_DISCOUNT").add(
-            Strategy("auto_id", "3673226"),
+            Strategy("auto_id", "3149378"),
         ).add(Strategy("name", "Discount", regex=True)),
         "ORDER_SHIPPING": Role("ORDER_SHIPPING").add(
-            Strategy("auto_id", "856094"),
+            Strategy("auto_id", "2753640"),
         ).add(Strategy("name", "Shipping", regex=True)),
         "ORDER_TOTAL_NET": Role("ORDER_TOTAL_NET").add(
-            Strategy("auto_id", "1314736"),
+            Strategy("auto_id", "4065694"),
         ).add(Strategy("name", "Total Gross", regex=True)).add(Strategy("name", "Total Net", regex=True)),
+        # Totals VAT is the only Edit named 'VAT' (the VAT-mode ComboBox is a
+        # ComboBox, excluded by the Edit control_type filter).
         "ORDER_TOTAL_VAT": Role("ORDER_TOTAL_VAT").add(
-            Strategy("auto_id", "2428812"),
-        ).add(Strategy("name", "VAT", regex=True)).add(Strategy("name", "Total VAT", regex=True)),
+            Strategy("control_type", "Edit", name_filter="VAT"),
+        ).add(Strategy("auto_id", "462516")).add(
+            Strategy("name", "VAT", regex=True)
+        ).add(Strategy("name", "Total VAT", regex=True)),
         "ORDER_TOTAL": Role("ORDER_TOTAL").add(
-            Strategy("auto_id", "2232014"),
-        ).add(Strategy("name", "Total", regex=True)),
+            Strategy("control_type", "Edit", name_filter="Total"),
+        ).add(Strategy("auto_id", "2688134")).add(Strategy("name", "Total", regex=True)),
 
         # -- Invoice editor ----------------------------------------------------
         "INVOICE_PAYMENT_METHOD": Role("INVOICE_PAYMENT_METHOD").add(
@@ -369,6 +393,20 @@ def default_registry() -> dict[str, Role]:
 # ---------------------------------------------------------------------------
 
 
+def _control_alive(control: Any) -> bool:
+    """Backend-agnostic liveness check (UIA wrappers have no ``exists()``)."""
+    check = getattr(control, "exists", None)
+    if callable(check):
+        try:
+            return bool(check(timeout=0.5))
+        except Exception:
+            return True
+    try:
+        return bool(control.is_visible())
+    except Exception:
+        return True
+
+
 class ControlFinder:
     """Resolves semantic roles to live pywinauto controls via the registry."""
 
@@ -391,11 +429,8 @@ class ControlFinder:
         key = (id(window), role)
         if key in self._cache:
             cached = self._cache[key]
-            try:
-                if cached.exists(timeout=0.5):
-                    return cached
-            except Exception:
-                pass
+            if _control_alive(cached):
+                return cached
             del self._cache[key]
 
         role_def = self.registry.get(role)
@@ -511,6 +546,18 @@ class ControlFinder:
                     if info is not None:
                         title = getattr(info, "name", "") or ""
                 if not re.search(value, title, re.IGNORECASE):
+                    return False
+            elif key == "name":
+                title = ""
+                try:
+                    title = control.window_text()
+                except Exception:
+                    pass
+                if not title:
+                    info = getattr(control, "element_info", None)
+                    if info is not None:
+                        title = getattr(info, "name", "") or ""
+                if (title or "").strip().lower() != str(value).strip().lower():
                     return False
             elif getattr(control, key, None) != value:
                 return False
