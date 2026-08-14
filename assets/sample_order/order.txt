@@ -1,5 +1,10 @@
+ORDER ORD-2026-0142
+Order date 18.03.2026
 Acme GmbH
-Rechnung Nr. PO-1042
-15.03.2026
-SKU-1001 2x 59,90 19%
-SKU-1002 3x 9,90 10%
+Max Mustermann
+Industriestr. 12
+60327 Frankfurt am Main
+SKU-1001 Heavy-duty cable 3m 2 59.90 19% 0%
+SKU-1002 HDMI adapter 3 9.90 19% 10%
+Net 146.53 VAT 27.84 TOTAL 174.37
+Payment Bank Transfer PAID 18.03.2026

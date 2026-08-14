@@ -1,69 +1,67 @@
 {
-  "extracted_order": {
-    "header": {
-      "order_date": "2026-03-15",
-      "external_reference": "PO-1042",
-      "price_mode": "Net",
-      "vat_mode": "With VAT",
-      "overall_discount_percent": "0",
-      "shipping_amount": "0",
-      "shipping_is_free": true
+  "header": {
+    "order_date": "2026-03-18",
+    "external_reference": "ORD-2026-0142",
+    "price_mode": "Net",
+    "vat_mode": "With VAT",
+    "overall_discount_percent": 0,
+    "shipping_amount": 0,
+    "shipping_is_free": true
+  },
+  "debtor": {
+    "company": "Acme GmbH",
+    "first_name": "Max",
+    "last_name": "Mustermann",
+    "salutation": "---",
+    "alias": "Acme GmbH",
+    "billing_address": {
+      "street": "Industriestr. 12",
+      "zip_code": "60327",
+      "city": "Frankfurt am Main",
+      "country": "Germany",
+      "email": "invoice@acme.example",
+      "telephone": "+49 69 1234 5678"
     },
-    "debtor": {
-      "company": "Acme GmbH",
-      "first_name": "Erika",
-      "last_name": "Mustermann",
-      "salutation": "Frau",
-      "alias": "acme",
-      "billing_address": {
-        "street": "Hauptstr. 12",
-        "zip_code": "10115",
-        "city": "Berlin",
-        "country": "Deutschland",
-        "email": "erika@acme.example",
-        "telephone": "+49 30 123456"
-      },
-      "delivery_address": {
-        "street": "",
-        "zip_code": "",
-        "city": "",
-        "country": "",
-        "email": "",
-        "telephone": ""
-      },
-      "same_delivery_address": true,
-      "payment_method": "Bank Transfer",
-      "price_mode": "Net",
-      "discount_percent": "0"
+    "delivery_address": {
+      "street": "Industriestr. 12",
+      "zip_code": "60327",
+      "city": "Frankfurt am Main",
+      "country": "Germany",
+      "email": "invoice@acme.example",
+      "telephone": "+49 69 1234 5678"
     },
-    "items": [
-      {
-        "sku": "SKU-1001",
-        "description": "Mechanical Keyboard",
-        "quantity": "2",
-        "unit_net_price": "59.90",
-        "vat_percent": "19",
-        "discount_percent": "0"
-      },
-      {
-        "sku": "SKU-1002",
-        "description": "USB-C Cable 2m",
-        "quantity": "3",
-        "unit_net_price": "9.90",
-        "vat_percent": "19",
-        "discount_percent": "10"
-      }
-    ],
-    "totals": {
-      "total_net": "146.53",
-      "total_vat": "27.84",
-      "total_gross": "174.37",
-      "currency": "EUR"
+    "same_delivery_address": true,
+    "payment_method": "Bank Transfer",
+    "price_mode": "Net",
+    "discount_percent": 0
+  },
+  "items": [
+    {
+      "sku": "SKU-1001",
+      "description": "Heavy-duty cable, 3m",
+      "quantity": 2,
+      "unit_net_price": 59.9,
+      "vat_percent": 19,
+      "discount_percent": 0
     },
-    "payment": {
-      "paid_status": "Paid",
-      "payment_date": "2026-03-18",
-      "payment_method": "Bank Transfer"
+    {
+      "sku": "SKU-1002",
+      "description": "HDMI adapter",
+      "quantity": 3,
+      "unit_net_price": 9.9,
+      "vat_percent": 19,
+      "discount_percent": 10
     }
+  ],
+  "totals": {
+    "total_net": 146.53,
+    "total_vat": 27.84,
+    "total_gross": 174.37,
+    "currency": "EUR"
+  },
+  "payment": {
+    "paid_status": "Paid",
+    "payment_date": "2026-03-18",
+    "payment_method": "Bank Transfer"
   }
 }
