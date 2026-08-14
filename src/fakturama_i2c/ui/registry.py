@@ -131,9 +131,7 @@ def default_registry() -> dict[str, Role]:
         # role raises ControlNotFoundError, which the flow surfaces honestly.
         "ORDER_VAT_MODE": Role("ORDER_VAT_MODE").add(
             Strategy("control_type", "ComboBox", name_filter="VAT"),
-        ).add(Strategy("auto_id", "134134")).add(
-            Strategy("control_type", "ComboBox", require_unique=False)
-        ),
+        ).add(Strategy("auto_id", "134134")),
         # The UPPER icon (existing contact) beside the Addresses section.
         # Distinct from the LOWER green "+" (new debtor) via ancestor scope
         # and name (tooltip). Order matters: the strongest signal first.
