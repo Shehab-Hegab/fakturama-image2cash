@@ -136,6 +136,14 @@ The installed console script is equivalent:
 fakturama-i2c --image path/to/order.png --dry-run
 ```
 
+A ready-made demo order and an **annotated screenshot** mapping every image
+region to its flow step ship in the repo:
+
+* `assets/sample_order/order.png` — demo order image (mock OCR/LLM sidecars included)
+* `assets/annotated/order_annotated.png` — annotated screenshot (STEP 2 debtor / STEP 3 items / STEP 4 totals / STEP 5 payment)
+
+Regenerate them at any time with `python scripts/make_demo_assets.py`.
+
 ## Running the tests
 
 ```powershell
