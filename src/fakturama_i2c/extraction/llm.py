@@ -10,6 +10,8 @@ Two providers ship:
 * ``openai``       -- any OpenAI-compatible ``/chat/completions`` endpoint
                       (OpenAI, Groq, or a self-hosted gateway via
                       ``I2C_LLM_BASE_URL``). Vision-capable model required.
+* ``anthropic``    -- Anthropic's native ``/v1/messages`` API (e.g. Claude
+                      with vision).
 
 Failures validate against the schema up to ``retry_attempts``; a run that
 cannot produce valid JSON raises :class:`ExtractionError` -- the flow never
@@ -236,13 +238,108 @@ class OpenAiCompatibleProvider(StructuredLlm):
         return base64.b64encode(image.read_bytes()).decode("ascii")
 
 
+class AnthropicProvider(StructuredLlm):
+    """Vision LLM via Anthropic's native ``/v1/messages`` API.
+
+    Uses the ``x-api-key`` header and the messages content blocks for images
+    (not the OpenAI-compatible shape). Parses the reply as JSON and validates
+    it with pydantic, retrying up to ``settings.retry_attempts``.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._base_url = (settings.llm_base_url or "https://api.anthropic.com").rstrip("/")
+        self._api_key = settings.llm_api_key or os.getenv("ANTHROPIC_API_KEY", "")
+        self._model = settings.llm_model or "claude-sonnet-4-20250514"
+
+    def extract_order(self, image: Path, ocr_hint: str = "") -> ExtractedOrder:
+        import requests  # imported lazily; requests is a runtime dependency
+
+        content: list[dict] = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": self._encode(image),
+                },
+            },
+            {"type": "text", "text": SYSTEM_PROMPT},
+        ]
+        if ocr_hint.strip():
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "OCR hint (may be noisy / optional, the image is "
+                        f"authoritative):\n{ocr_hint[:4000]}"
+                    ),
+                }
+            )
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self._settings.retry_attempts + 1):
+            try:
+                resp = requests.post(
+                    f"{self._base_url}/v1/messages",
+                    headers={
+                        "x-api-key": self._api_key,
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self._model,
+                        "max_tokens": 4096,
+                        "temperature": 0,
+                        "system": SYSTEM_PROMPT,
+                        "messages": [{"role": "user", "content": content}],
+                    },
+                    timeout=self._settings.llm_timeout,
+                )
+                resp.raise_for_status()
+                text = "".join(
+                    block.get("text", "") for block in resp.json().get("content", [])
+                )
+                order = self._parse(text)
+                logger.info("llm extraction ok on attempt %d", attempt)
+                return order
+            except Exception as exc:  # noqa: BLE001 - retryable in nature
+                last_error = exc
+                logger.warning("llm extraction attempt %d failed: %s", attempt, exc)
+        raise ExtractionError(
+            step="extract.llm",
+            detail=f"vision LLM could not produce a valid ExtractedOrder: {last_error}",
+        )
+
+    def _encode(self, image: Path) -> str:
+        return base64.b64encode(image.read_bytes()).decode("ascii")
+
+    def _parse(self, raw: str) -> ExtractedOrder:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```", 2)[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.rsplit("```", 1)[0].strip()
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"LLM reply is not valid JSON: {exc}") from exc
+        if isinstance(payload, dict) and "extracted_order" in payload:
+            payload = payload["extracted_order"]
+        try:
+            return ExtractedOrder.model_validate(payload)
+        except Exception as exc:
+            raise ValueError(f"LLM JSON failed schema validation: {exc}") from exc
+
+
 def get_llm_provider(settings: Settings) -> StructuredLlm:
     """Factory for the configured vision-LLM provider."""
     providers: dict[str, type[StructuredLlm]] = {
         "mock": MockLlmProvider,
         "openai": OpenAiCompatibleProvider,
         "groq": OpenAiCompatibleProvider,
-        "anthropic": OpenAiCompatibleProvider,
+        "anthropic": AnthropicProvider,
     }
     cls = providers.get(settings.llm_provider)
     if cls is None:

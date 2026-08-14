@@ -355,7 +355,7 @@ class Verifier:
     def _open_menu(self, window: Any, top: str, item: str) -> None:
         try:
             menu_ctrl = self.finder.resolve(window, "MENU_DATA")
-            Menu(menu_ctrl, self.waits).select_item(item)
+            Menu(menu_ctrl, self.waits).select_item(top, item)
             return
         except ControlNotFoundError:
             pass

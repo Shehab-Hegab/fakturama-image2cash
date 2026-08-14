@@ -100,7 +100,7 @@ The `.env` file drives everything via `I2C_*` variables. Key ones:
 | `I2C_OCR_ENGINE` | `mock` (sidecar `.txt`), `tesseract`, `easyocr` | `mock` |
 | `I2C_LLM_PROVIDER` | `mock` (sidecar `.json`), `openai`, `groq`, `anthropic` | `mock` |
 | `I2C_LLM_API_KEY` | API key for the chosen LLM provider | *(empty)* |
-| `I2C_LLM_MODEL` / `I2C_LLM_BASE_URL` | Model name / OpenAI-compatible base URL | *(empty)* |
+| `I2C_LLM_MODEL` / `I2C_LLM_BASE_URL` | Model name / OpenAI-compatible base URL (used by `openai`/`groq`) | *(empty)* |
 
 With the default `mock` engines the whole pipeline runs fully offline: OCR text
 is read from `<image>.txt` and the structured result from `<image>.json` next to
