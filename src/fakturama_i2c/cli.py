@@ -87,7 +87,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 def _dump_tree(settings: Settings, launch: bool) -> int:
     app = _connect(settings, launch)
-    print(describe(app.main_window()))
+    tree_text = describe(app.main_window())
+    print(tree_text)
+    out = _ROOT / ".elements.txt"
+    try:
+        out.write_text(tree_text, encoding="utf-8")
+        print(f"[+] UI tree saved to {out}")
+    except OSError as exc:
+        logger.debug("could not save UI tree to %s: %s", out, exc)
     return 0
 
 

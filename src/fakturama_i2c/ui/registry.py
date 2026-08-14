@@ -140,6 +140,8 @@ def default_registry() -> dict[str, Role]:
         "DEBTOR_SELECTOR": Role("DEBTOR_SELECTOR").add(
             Strategy("name", r"(?i)(select|choose|address).*(contact|customer|address)", regex=True),
         ).add(
+            Strategy("control_type", "Image", in_ancestor="Addresses", ancestor_kind="name", require_unique=False),
+        ).add(
             Strategy("control_type", "Button", in_ancestor="Addresses", ancestor_kind="name"),
         ).add(
             Strategy("control_type", "Button"),
@@ -250,6 +252,8 @@ def default_registry() -> dict[str, Role]:
         # from the green "+" (new product) via ancestor scope + name.
         "PRODUCT_SELECTOR": Role("PRODUCT_SELECTOR").add(
             Strategy("name", r"(?i)(select|search).*(product|item)", regex=True),
+        ).add(
+            Strategy("control_type", "Image", in_ancestor="Items", ancestor_kind="name", require_unique=False),
         ).add(
             Strategy("control_type", "Button", in_ancestor="Items", ancestor_kind="name"),
         ).add(
