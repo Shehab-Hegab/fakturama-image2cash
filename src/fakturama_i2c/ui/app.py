@@ -37,11 +37,45 @@ class AppController:
         subprocess.Popen([exe], cwd=None)
         self.wait_for_main_window(self.settings.window_timeout)
 
+    def _pick_main_element(self):
+        """Pick the best Fakturama top-level window element.
+
+        Multiple windows often match the title (splash / initialization dialog
+        plus the real main window). Rank by visibility, real SWT windows first,
+        and deprioritise splash / initialization titles.
+        """
+        from pywinauto import findwindows
+
+        els = findwindows.find_elements(
+            title_re=f".*{self.settings.window_title}.*",
+            backend=self.settings.uia_backend,
+        )
+        candidates = [
+            e
+            for e in els
+            if getattr(e, "visible", True) and (e.name or "").strip()
+        ]
+
+        def rank(e):
+            name = (e.name or "").lower()
+            splash = 1 if ("initialization" in name or "splash" in name) else 0
+            not_swt = 0 if (e.class_name or "").startswith("SWT_Window") else 1
+            return (splash, not_swt)
+
+        candidates.sort(key=rank)
+        if not candidates:
+            raise ControlNotFoundError(
+                "attach",
+                f"no Fakturama window matching title {self.settings.window_title!r}",
+            )
+        return candidates[0]
+
     def attach(self) -> None:
         """Attach to an already running Fakturama instance by window title."""
         logger.info("attaching to Fakturama (title=%r)", self.settings.window_title)
+        element = self._pick_main_element()
         self.app = Application(backend=self.settings.uia_backend).connect(
-            title_re=f".*{self.settings.window_title}.*"
+            handle=element.handle
         )
         self.wait_for_main_window(self.settings.window_timeout)
 

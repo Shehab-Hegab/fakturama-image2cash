@@ -89,26 +89,31 @@ class Role:
 def default_registry() -> dict[str, Role]:
     return {
         # -- top toolbar ---------------------------------------------------
+        # Real Fakturama tooltips: 'Create: New Order', 'Create: New Invoice',
+        # 'Create a new product', 'Create a new contact'. The toolbar buttons
+        # expose no automation_id, so the tooltip name is the reliable signal.
         "ORDER_NEW_BUTTON": Role("ORDER_NEW_BUTTON").add(
             Strategy("auto_id", "order.new"),
-        ).add(Strategy("name", "New Order", regex=True)),
+        ).add(Strategy("name", r"(?i)create.*new order", regex=True)),
         "INVOICE_NEW_BUTTON": Role("INVOICE_NEW_BUTTON").add(
             Strategy("auto_id", "invoice.new"),
-        ).add(Strategy("name", "New Invoice", regex=True)),
+        ).add(Strategy("name", r"(?i)create.*new invoice", regex=True)),
 
         # -- Order editor ---------------------------------------------------
+        # auto_ids are per-instance SWT ids (strongest when present); name
+        # strategies remain the cross-session fallback chain.
         "ORDER_DATE": Role("ORDER_DATE").add(
-            Strategy("control_type", "Edit"),
+            Strategy("auto_id", "1246152"),
         ).add(Strategy("name", "Date", regex=True)),
         "ORDER_REFERENCE": Role("ORDER_REFERENCE").add(
-            Strategy("name", "Cust.Ref.", regex=True),
-        ).add(Strategy("name", "Ref.", regex=True)),
+            Strategy("auto_id", "2295810"),
+        ).add(Strategy("name", "Cust.Ref.", regex=True)).add(Strategy("name", "Ref.", regex=True)),
         "ORDER_PRICE_MODE": Role("ORDER_PRICE_MODE").add(
-            Strategy("name", "Price", regex=True),
-        ),
+            Strategy("auto_id", "9044880"),
+        ).add(Strategy("name", "Price", regex=True)),
         "ORDER_VAT_MODE": Role("ORDER_VAT_MODE").add(
-            Strategy("name", "VAT", regex=True),
-        ),
+            Strategy("auto_id", "1249396"),
+        ).add(Strategy("name", "VAT", regex=True)),
         # The UPPER icon (existing contact) beside the Addresses section.
         # Distinct from the LOWER green "+" (new debtor) via ancestor scope
         # and name (tooltip). Order matters: the strongest signal first.
@@ -178,7 +183,7 @@ def default_registry() -> dict[str, Role]:
             Strategy("name", "Payment", regex=True),
         ),
         "NEW_CONTACT_BUTTON": Role("NEW_CONTACT_BUTTON").add(
-            Strategy("name", "New Contact", regex=True),
+            Strategy("name", r"(?i)create.*contact", regex=True),
         ).add(Strategy("auto_id", "contact.new")),
 
         # -- terms of payment (Data > terms of payment) --------------------
@@ -233,7 +238,7 @@ def default_registry() -> dict[str, Role]:
             Strategy("control_type", "Button"),
         ).add(Strategy("class", "SWT.Button")),
         "PRODUCT_NEW_BUTTON": Role("PRODUCT_NEW_BUTTON").add(
-            Strategy("name", "New product", regex=True),
+            Strategy("name", r"(?i)create.*product", regex=True),
         ).add(Strategy("auto_id", "product.new")),
         "PRODUCT_ITEM_NUMBER": Role("PRODUCT_ITEM_NUMBER").add(
             Strategy("name", "Item Number", regex=True),
@@ -282,20 +287,20 @@ def default_registry() -> dict[str, Role]:
             Strategy("control_type", "Table"),
         ).add(Strategy("class", "SWT.Table")),
         "ORDER_DISCOUNT": Role("ORDER_DISCOUNT").add(
-            Strategy("name", "Discount", regex=True),
-        ),
+            Strategy("auto_id", "3673226"),
+        ).add(Strategy("name", "Discount", regex=True)),
         "ORDER_SHIPPING": Role("ORDER_SHIPPING").add(
-            Strategy("name", "Shipping", regex=True),
-        ),
+            Strategy("auto_id", "856094"),
+        ).add(Strategy("name", "Shipping", regex=True)),
         "ORDER_TOTAL_NET": Role("ORDER_TOTAL_NET").add(
-            Strategy("name", "Total Net", regex=True),
-        ),
+            Strategy("auto_id", "1314736"),
+        ).add(Strategy("name", "Total Gross", regex=True)).add(Strategy("name", "Total Net", regex=True)),
         "ORDER_TOTAL_VAT": Role("ORDER_TOTAL_VAT").add(
-            Strategy("name", "Total VAT", regex=True),
-        ),
+            Strategy("auto_id", "2428812"),
+        ).add(Strategy("name", "VAT", regex=True)).add(Strategy("name", "Total VAT", regex=True)),
         "ORDER_TOTAL": Role("ORDER_TOTAL").add(
-            Strategy("name", "Total", regex=True),
-        ),
+            Strategy("auto_id", "2232014"),
+        ).add(Strategy("name", "Total", regex=True)),
 
         # -- Invoice editor ----------------------------------------------------
         "INVOICE_PAYMENT_METHOD": Role("INVOICE_PAYMENT_METHOD").add(
@@ -328,20 +333,31 @@ def default_registry() -> dict[str, Role]:
             Strategy("control_type", "Table"),
         ).add(Strategy("class", "SWT.Table")),
         "FOLLOW_UP_INVOICE": Role("FOLLOW_UP_INVOICE").add(
-            Strategy("name", "Invoice", regex=True),
-        ),
+            Strategy(
+                "name",
+                r"(?i)invoice",
+                regex=True,
+                in_ancestor="Create a follow-up document",
+                ancestor_kind="name",
+            ),
+        ).add(Strategy(
+            "control_type",
+            "Button",
+            in_ancestor="Create a follow-up document",
+            ancestor_kind="name",
+        )).add(Strategy("name", r"(?i)follow.?up.*invoice", regex=True)),
         "MENU_DATA": Role("MENU_DATA").add(
             Strategy("name", "Data", regex=True),
         ),
         "MENU_TERMS_OF_PAYMENT": Role("MENU_TERMS_OF_PAYMENT").add(
-            Strategy("name", "Terms of payment", regex=True),
-        ),
+            Strategy("control_type", "MenuItem", in_ancestor="Data", ancestor_kind="name"),
+        ).add(Strategy("name", "Terms of payment", regex=True)),
         "MENU_VATS": Role("MENU_VATS").add(
-            Strategy("name", "VATs", regex=True),
-        ),
+            Strategy("control_type", "MenuItem", in_ancestor="Data", ancestor_kind="name"),
+        ).add(Strategy("name", "VATs", regex=True)),
         "MENU_DOCUMENTS": Role("MENU_DOCUMENTS").add(
-            Strategy("name", "Documents", regex=True),
-        ),
+            Strategy("control_type", "MenuItem", in_ancestor="Data", ancestor_kind="name"),
+        ).add(Strategy("name", "Documents", regex=True)),
         "DOCUMENTS_TABLE": Role("DOCUMENTS_TABLE").add(
             Strategy("control_type", "Table"),
         ).add(Strategy("class", "SWT.Table")),
@@ -359,8 +375,11 @@ class ControlFinder:
     def __init__(self, settings: Settings, registry: Optional[dict[str, Role]] = None) -> None:
         self.settings = settings
         self.registry = registry or default_registry()
-        # role name -> cached resolved control (grounded once, reused)
-        self._cache: dict[str, Any] = {}
+        # (window identity, role) -> cached resolved control.
+        # Keyed by window object identity so two editor tabs inside the same
+        # HWND (Fakturama opens editors as tabs, all sharing the main HWND)
+        # never leak cached controls across panes.
+        self._cache: dict[tuple[int, str], Any] = {}
 
     def resolve(self, window, role: str) -> Any:
         """Return the pywinauto control for ``role`` inside ``window``.
@@ -369,14 +388,15 @@ class ControlFinder:
         strategy list. Raises ControlNotFoundError if every strategy fails or
         the ancestor scope is missing.
         """
-        if role in self._cache:
-            cached = self._cache[role]
+        key = (id(window), role)
+        if key in self._cache:
+            cached = self._cache[key]
             try:
                 if cached.exists(timeout=0.5):
                     return cached
             except Exception:
                 pass
-            del self._cache[role]
+            del self._cache[key]
 
         role_def = self.registry.get(role)
         if role_def is None:
@@ -387,14 +407,20 @@ class ControlFinder:
             if not matches:
                 continue
             if strategy.require_unique and len(matches) > 1:
-                # Tie => ambiguity. Per spec we must not guess.
-                raise ManualReviewError(
-                    role,
-                    f"strategy {strategy} matched {len(matches)} controls; "
-                    "refine the registry (ancestor scope) before continuing",
-                )
+                # Tie => ambiguity. Per spec we must not guess. But when a
+                # label Static and its value Edit share a name (SWT pattern),
+                # prefer the interactive field (Edit/Combo) if exactly one
+                # matches -- a property-based, never positional, tie-break.
+                interactive = self._prefer_interactive(matches)
+                if len(interactive) != 1:
+                    raise ManualReviewError(
+                        role,
+                        f"strategy {strategy} matched {len(matches)} controls; "
+                        "refine the registry (ancestor scope) before continuing",
+                    )
+                matches = interactive
             control = matches[0]
-            self._cache[role] = control
+            self._cache[key] = control
             return control
 
         raise ControlNotFoundError(
@@ -455,13 +481,35 @@ class ControlFinder:
         return None
 
     @staticmethod
+    def _prefer_interactive(matches: list[Any]) -> list[Any]:
+        """Keep only Edit/Combo controls when a label/value name-tie occurs."""
+        interactive = []
+        for ctrl in matches:
+            ctype = ""
+            try:
+                ctype = (ctrl.element_info.control_type or "").lower()
+            except Exception:
+                pass
+            if ctype in ("edit", "combo", "combobox") or ctype.startswith("combo"):
+                interactive.append(ctrl)
+        return interactive or matches
+
+    @staticmethod
     def _criteria_match(control, kwargs: dict[str, Any]) -> bool:
         """Duck-typed criteria check used by the ``descendants()`` fallback."""
         import re
 
         for key, value in kwargs.items():
             if key == "title_re":
-                title = getattr(control, "title", None) or ""
+                title = ""
+                try:
+                    title = control.window_text()
+                except Exception:
+                    pass
+                if not title:
+                    info = getattr(control, "element_info", None)
+                    if info is not None:
+                        title = getattr(info, "name", "") or ""
                 if not re.search(value, title, re.IGNORECASE):
                     return False
             elif getattr(control, key, None) != value:

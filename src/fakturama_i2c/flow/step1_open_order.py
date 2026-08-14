@@ -31,7 +31,9 @@ def step_open_new_order(ctx: FlowContext) -> None:
         return
 
     Button(ctx.find("ORDER_NEW_BUTTON"), ctx.waits).click()
-    editor = ctx.waits.for_window(ctx.app.desktop, ORDER_EDITOR_TITLE, ctx.settings.window_timeout)
+    # Fakturama opens the New Order editor as a tab inside the main window,
+    # not a top-level window -- wait_for_editor handles both cases.
+    editor = ctx.wait_for_editor(ORDER_EDITOR_TITLE, "ORDER_DATE")
     ctx.set_window(editor)
 
     # Proposed No. is left unchanged (Fakturama assigns the number on save).

@@ -146,13 +146,18 @@ class FlowContext:
         Button(self.find("OK_BUTTON"), self.waits).click()
 
     def wait_for_editor(self, title: str, probe_role: str) -> Any:
-        """Wait for a window whose title contains ``title`` AND exposes ``probe_role``.
+        """Wait for an editor (dialog window OR tab pane) matching ``title``
+        that also exposes ``probe_role``.
 
-        Scans the desktop (not just one match) so an ambiguous fragment like
-        "Terms of payment" never binds to the wrong window.
+        Fakturama opens Order/Invoice/Product/Contact editors as *tabs inside
+        the main window* -- they are not top-level windows. We therefore scan
+        the desktop for a matching dialog first, then the main window's
+        tab/pane descendants. Never binds to the first partial title match;
+        the ``probe_role`` must resolve inside the candidate.
         """
         deadline = time.monotonic() + self.settings.window_timeout
         while time.monotonic() < deadline:
+            # 1) top-level dialogs (e.g. 'Terms of payment', 'VATs')
             for win in self.app.desktop.windows():
                 try:
                     text = win.window_text()
@@ -164,12 +169,46 @@ class FlowContext:
                     self.finder.resolve(win, probe_role)
                 except Exception:
                     continue
-                # Anchor only after the probe resolved, so a timeout never
-                # leaves _current_window on a half-scanned window.
                 self.set_window(win)
                 return win
+            # 2) editor tab/pane inside the main window
+            pane = self._find_editor_pane(title, probe_role)
+            if pane is not None:
+                return pane
             time.sleep(0.3)
-        raise ControlNotFoundError(probe_role, f"editor window '{title}' not found")
+        raise ControlNotFoundError(probe_role, f"editor '{title}' not found")
+
+    def _find_editor_pane(self, title: str, probe_role: str) -> Optional[Any]:
+        """Locate an editor Tab/Pane named like ``title`` that resolves probe."""
+        try:
+            main = self.app.main_window()
+        except Exception:
+            return None
+        wanted = title.lower()
+        for ctype in ("Tab", "TabItem", "Pane"):
+            for cand in self._pane_candidates(main, ctype, wanted):
+                try:
+                    self.finder.resolve(cand, probe_role)
+                except Exception:
+                    continue
+                self.set_window(cand)
+                return cand
+        return None
+
+    def _pane_candidates(self, main: Any, ctype: str, wanted: str) -> list[Any]:
+        try:
+            nodes = list(main.descendants(control_type=ctype))
+        except Exception:
+            return []
+        out = []
+        for node in nodes:
+            try:
+                text = (node.window_text() or "").strip()
+            except Exception:
+                continue
+            if text and wanted in text.lower():
+                out.append(node)
+        return out
 
     # -- internals ------------------------------------------------------------
 
