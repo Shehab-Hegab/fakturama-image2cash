@@ -288,16 +288,16 @@ def _verify_documents(ctx: FlowContext, order_win) -> None:
     try:
         docs_win = ctx.waits.for_window(ctx.app.desktop, DOCUMENTS_DIALOG_TITLE, ctx.settings.window_timeout)
         ctx.set_window(docs_win)
-    except Exception:
-        logger.warning("step4: Documents dialog not found as top-level window; skipping document verification")
-        return
+    except Exception as exc:
+        raise ManualReviewError("step4.documents", "Documents view is not available") from exc
     try:
         ctx.waits.stable_snapshot(ctx.find("DOCUMENTS_TABLE"))
         table = Table(ctx.find("DOCUMENTS_TABLE"), ctx.waits)
         rows = table.rows()
-    except Exception:
-        logger.warning("step4: DOCUMENTS_TABLE not visible to UIA (SWT); skipping verification")
-        return
+    except Exception as exc:
+        raise ManualReviewError(
+            "step4.documents", "Documents table is not exposed by UIA"
+        ) from exc
     ref = ctx.extracted.header.external_reference
     totals: OrderTotals = ctx.extracted.totals
     candidates = candidate_doc_rows(rows, ref, ctx.extracted.header.order_date, totals.total_gross)

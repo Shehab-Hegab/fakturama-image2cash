@@ -64,12 +64,10 @@ def _select_or_create(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
     table = ctx.open_search_dialog(ADDRESS_DIALOG_TITLE, debtor.search_key)
 
     if table is None:
-        # Keyboard fallback was used (SWT Table invisible to UIA).
-        # We typed the search + TAB + ENTER — trust the keyboard selection
-        # and return.  If the contact wasn't found, Fakturama will show it.
-        logger.info("step2: keyboard fallback used for debtor selection; trusting ENTER")
-        ctx.set_window(order_win)
-        return
+        raise ManualReviewError(
+            "step2.debtor.select",
+            "address result table is not exposed by UIA; exact debtor match cannot be proven",
+        )
 
     rows = table.rows()
     matches = [i for i, r in enumerate(rows) if row_matches_exact(r, _expected_debtor_cells(debtor))]
@@ -99,9 +97,10 @@ def _reopen_and_select(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
     table = ctx.open_search_dialog(ADDRESS_DIALOG_TITLE, debtor.search_key)
 
     if table is None:
-        logger.info("step2: keyboard fallback for re-select; trusting ENTER")
-        ctx.set_window(order_win)
-        return
+        raise ManualReviewError(
+            "step2.debtor.reverify",
+            "address result table is not exposed by UIA; newly created debtor cannot be proven",
+        )
 
     rows = table.rows()
     matches = [i for i, r in enumerate(rows) if row_matches_exact(r, _expected_debtor_cells(debtor))]

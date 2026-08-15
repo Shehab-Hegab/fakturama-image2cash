@@ -125,18 +125,11 @@ def _set_vat_mode(ctx: FlowContext, expected: str) -> None:
         try:
             _select_vat_mode(ctx, expected)
             return
-        except ControlNotFoundError:
-            if expected == VatMode.WITH_VAT.value:
-                logger.info(
-                    "step1: ORDER_VAT_MODE control not rendered by SWT; "
-                    "trusting Fakturama default 'With VAT'"
-                )
-                return
+        except ControlNotFoundError as exc:
             raise ManualReviewError(
                 "step1.open_order.vat",
-                "VAT-mode combo not exposed by SWT and expected value "
-                f"{expected!r} differs from Fakturama's default 'With VAT'",
-            )
+                f"VAT-mode combo not exposed by SWT; cannot prove expected {expected!r}",
+            ) from exc
 
 
 def _select_vat_mode(ctx: FlowContext, expected: str) -> None:

@@ -104,26 +104,17 @@ def _select_existing_product(ctx: FlowContext, order_win, item: ItemLine) -> boo
     _click_product_selector(ctx)
     try:
         table = ctx.open_search_dialog(PRODUCT_DIALOG_TITLE, item.sku)
-    except (FlowTimeoutError, ControlNotFoundError):
-        # The "Select a product" dialog is an SWT modal child that may not
-        # appear as a top-level window.  If we can't find it at all, treat
-        # the product as "not found" so the creation path runs.
-        logger.info(
-            "step3: product search dialog not found for %r; "
-            "will create product via Product editor",
-            item.sku,
-        )
-        ctx.cancel_dialog()  # best-effort close any lingering dialog
-        ctx.set_window(order_win)
-        return False
+    except (FlowTimeoutError, ControlNotFoundError) as exc:
+        raise ManualReviewError(
+            "step3.product.select",
+            f"product selector for {item.sku!r} is unavailable; cannot prove it is missing",
+        ) from exc
 
     if table is None:
-        # Keyboard fallback was used (SWT Table invisible to UIA).
-        # {DOWN}{ENTER} already selected the product and closed the dialog.
-        # Trust that the selection succeeded (product exists in Fakturama).
-        logger.info("step3: keyboard fallback used — product %r selected via {DOWN}{ENTER}", item.sku)
-        ctx.set_window(order_win)
-        return True
+        raise ManualReviewError(
+            "step3.product.select",
+            f"product result table is not exposed by UIA; exact SKU {item.sku!r} cannot be proven",
+        )
 
     rows = table.rows()
     matches = [i for i, r in enumerate(rows) if row_has_exact(r, item.sku)]
@@ -160,11 +151,10 @@ def _select_new_product(ctx: FlowContext, order_win, item: ItemLine) -> None:
         table = ctx.open_search_dialog(PRODUCT_DIALOG_TITLE, item.sku)
 
     if table is None:
-        # Keyboard fallback: we typed search + TAB + ENTER.
-        # Trust that the product was selected.
-        logger.info("step3: keyboard fallback for new product selection; trusting ENTER")
-        ctx.set_window(order_win)
-        return
+        raise ManualReviewError(
+            "step3.product.verify",
+            f"new product {item.sku!r} cannot be verified because the result table is unavailable",
+        )
 
     rows = table.rows()
     matches = [i for i, r in enumerate(rows) if row_has_exact(r, item.sku)]
@@ -203,27 +193,21 @@ def _ensure_vat(ctx: FlowContext, order_win, vat_percent: Decimal) -> None:
     try:
         ctx.menu_select("MENU_DATA", "MENU_VATS", "VATs")
     except (ControlNotFoundError, FlowTimeoutError) as exc:
-        logger.warning(
-            "step3: Data>VATs navigation failed (%s); "
-            "assuming VAT %r already exists in Product editor",
-            exc, label,
-        )
-        return
+        raise ManualReviewError(
+            "step3.vat.select", f"cannot open VATs to verify {label!r}"
+        ) from exc
 
     # Wait until the VATs TabItem is selected inside the main window.
     _wait_for_tab_selected(ctx.app.main_window(), "VATs", ctx.settings.window_timeout)
     ctx.set_window(ctx.app.main_window())
     logger.info("step3: VATs tab is now active")
 
-    # --- 2. Check if VAT already exists (best-effort) -------------------
-    # The bottom-panel table is SWT-invisible to UIA.  We attempt to read
-    # it; if RESULT_TABLE is missing we skip the check and always create
-    # (creating a duplicate is harmless — Fakturama allows it).
+    # --- 2. Check if VAT already exists ----------------------------------
     vat_found = False
     try:
         table_ctrl = ctx.find("RESULT_TABLE")
         ctx.waits.stable_snapshot(table_ctrl)
-        Edit(ctx.find("SEARCH_EDIT"), self.waits).fill(label)
+        Edit(ctx.find("SEARCH_EDIT"), ctx.waits).fill(label)
         ctx.waits.stable_snapshot(table_ctrl)
         table = Table(table_ctrl, ctx.waits)
         rows = table.rows()
@@ -241,7 +225,9 @@ def _ensure_vat(ctx: FlowContext, order_win, vat_percent: Decimal) -> None:
     except ManualReviewError:
         raise
     except Exception as exc:
-        logger.debug("step3: VAT table scan skipped (%s); will create VAT", exc)
+        raise ManualReviewError(
+            "step3.vat.select", f"cannot inspect existing VAT records for {label!r}"
+        ) from exc
 
     if vat_found:
         # Close VATs tab and return to the order
