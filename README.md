@@ -150,12 +150,19 @@ The full end-to-end flow runs successfully against a live Fakturama instance.
 All five steps pass: Open Order, Resolve Debtor, Add Products, Complete Order
 (save + open linked Invoice), and Create Invoice (apply payment + verify).
 
-Evidence screenshots are captured at each stage:
+Evidence screenshots captured from a live Fakturama run:
 
-- [`assets/screenshots/01_source_order.png`](assets/screenshots/01_source_order.png) — source order image
-- [`assets/screenshots/02_saved_order.png`](assets/screenshots/02_saved_order.png) — saved Order with line items + totals
-- [`assets/screenshots/03_linked_paid_invoice.png`](assets/screenshots/03_linked_paid_invoice.png) — Invoice with payment applied
-- [`assets/screenshots/04_documents_final_state.png`](assets/screenshots/04_documents_final_state.png) — Documents list confirming Order + Invoice pair
+![Source Order](assets/screenshots/01_source_order.png)
+*Source order image — ORD-2026-0142, Acme GmbH, $174.37*
+
+![Saved Order](assets/screenshots/02_saved_order.png)
+*Saved Order PO000034 — SKU-1001 (2×$59.90) + SKU-1002 (3×$9.90, −10%), Total Net $146.53, VAT $27.84, Gross $174.37*
+
+![Paid Invoice](assets/screenshots/03_linked_paid_invoice.png)
+*Linked Invoice INV000010 — Bank Transfer, paid, $174.37, Mar 18 2026*
+
+![Documents Panel](assets/screenshots/04_documents_final_state.png)
+*Documents panel confirming Order→Invoice pair — INV000010 linked to PO000034, both $174.37, paid*
 
 See [`E2E_VERIFICATION_REPORT.md`](E2E_VERIFICATION_REPORT.md) for the
 step-by-step results and Fakturama state after the run.

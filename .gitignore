@@ -19,7 +19,6 @@ env/
 .env.*
 
 # Runtime artifacts
-assets/screenshots/
 assets/checkpoints/
 assets/logs/
 .elements.txt
