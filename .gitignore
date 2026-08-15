@@ -23,6 +23,22 @@ assets/screenshots/
 assets/checkpoints/
 assets/logs/
 .elements.txt
+live_uia_dump.txt
+pdf_extracted.txt
+
+# Debug logs
+*.log
+
+# Debug scripts (not part of the product)
+scripts/cleanup_tabs.py
+scripts/close_tabs_fast.py
+scripts/close_tabs_v2.py
+scripts/dump_uia_deep.py
+scripts/dump_uia_tree.py
+scripts/seed_master_data.py
+
+# Debug screenshot copies
+src/screenshots/
 
 # Test / tooling caches
 .pytest_cache/

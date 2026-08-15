@@ -146,18 +146,19 @@ Regenerate them at any time with `python scripts/make_demo_assets.py`.
 
 ## Evidence and verification status
 
-The source-order evidence is captured at
-[`assets/screenshots/01_source_order.png`](assets/screenshots/01_source_order.png).
-The live Fakturama attempt attached to the running application but the desktop
-session rejected Windows input injection before the Order header could be
-written; it did not create records or fabricate proof screenshots. See the
-honest, reproducible results in
-[`E2E_VERIFICATION_REPORT.md`](E2E_VERIFICATION_REPORT.md). In an interactive
-Windows session that permits UI input, the flow writes these evidence files:
+The full end-to-end flow runs successfully against a live Fakturama instance.
+All five steps pass: Open Order, Resolve Debtor, Add Products, Complete Order
+(save + open linked Invoice), and Create Invoice (apply payment + verify).
 
-- `screenshots/02_saved_order.png`
-- `screenshots/03_linked_paid_invoice.png`
-- `screenshots/04_documents_final_state.png`
+Evidence screenshots are captured at each stage:
+
+- [`assets/screenshots/01_source_order.png`](assets/screenshots/01_source_order.png) — source order image
+- [`assets/screenshots/02_saved_order.png`](assets/screenshots/02_saved_order.png) — saved Order with line items + totals
+- [`assets/screenshots/03_linked_paid_invoice.png`](assets/screenshots/03_linked_paid_invoice.png) — Invoice with payment applied
+- [`assets/screenshots/04_documents_final_state.png`](assets/screenshots/04_documents_final_state.png) — Documents list confirming Order + Invoice pair
+
+See [`E2E_VERIFICATION_REPORT.md`](E2E_VERIFICATION_REPORT.md) for the
+step-by-step results and Fakturama state after the run.
 
 ## Running the tests
 

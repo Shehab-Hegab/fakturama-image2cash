@@ -162,27 +162,62 @@ class FlowContext:
         # Stage 1: type the search term — a failure HERE is real and fatal.
         try:
             search_edit = self.find("SEARCH_EDIT")
+            # Clear any existing text first
+            search_edit.click_input()
+            time.sleep(0.2)
             Edit(search_edit, self.waits).fill(search_text)
-            time.sleep(0.5)
+            time.sleep(0.8)  # SWT needs time to filter the virtual table
         except Exception as exc:
             raise ManualReviewError(
                 "search_dialog.keyboard",
                 f"keyboard fallback for '{dialog_title}' failed at SEARCH_EDIT stage: {exc}",
             ) from exc
+        # Best-effort verification: SWT often reports empty text even when the
+        # fill landed, so re-typing is a diagnostic and must NEVER be fatal.
+        try:
+            shown = "".join(search_edit.texts())
+            if search_text not in shown:
+                logger.info(
+                    "open_search_dialog: SEARCH_EDIT text unverified (%r); re-typing via keyboard",
+                    shown,
+                )
+                try:
+                    search_edit.click_input()
+                    time.sleep(0.2)
+                    search_edit.type_keys("^a{BACKSPACE}", pause=0.02)
+                    time.sleep(0.1)
+                    search_edit.type_keys(search_text, pause=0.03)
+                    time.sleep(0.8)  # Wait for SWT to filter results
+                except Exception as retry_exc:
+                    logger.warning(
+                        "open_search_dialog: re-typing failed (non-fatal): %s", retry_exc
+                    )
+        except Exception:
+            pass
         # Stage 2: SWT virtual tables do not expose rows through UIA.  The
         # documented, layout-independent traversal is search -> DOWN -> ENTER.
         # This deliberately never synthesizes a mouse coordinate.
         try:
             win.set_focus()
-            time.sleep(0.2)
-            win.type_keys("{DOWN}")
             time.sleep(0.3)
+            win.type_keys("{DOWN}")
+            time.sleep(0.5)  # Wait for selection to settle
             win.type_keys("{ENTER}")
         except Exception as exc:
-            raise ManualReviewError(
-                "search_dialog.keyboard",
-                f"keyboard selection for '{dialog_title}' failed: {exc}",
-            ) from exc
+            # SWT closes the dialog as soon as ENTER commits the row; pywinauto
+            # then raises on the (now dead) window handle.  Only a dialog that
+            # is STILL OPEN is a real failure.
+            still_open = False
+            try:
+                still_open = self.app.desktop.window(title=dialog_title).exists()
+            except Exception:
+                still_open = True
+            if still_open:
+                raise ManualReviewError(
+                    "search_dialog.keyboard",
+                    f"keyboard selection for '{dialog_title}' failed: {exc}",
+                ) from exc
+            logger.info("open_search_dialog: dialog closed by keyboard selection (%s)", exc)
         time.sleep(0.5)
         return None  # Caller must handle None return (table not readable)
 
@@ -358,7 +393,7 @@ class FlowContext:
         table.select_row(row_index)
         Button(self.find("OK_BUTTON"), self.waits).click()
 
-    def wait_for_editor(self, title: str, probe_role: str) -> Any:
+    def wait_for_editor(self, title: str, probe_role: str, timeout: float | None = None) -> Any:
         """Wait for an editor (dialog window OR tab pane) matching ``title``
         that also exposes ``probe_role``.
 
@@ -368,7 +403,7 @@ class FlowContext:
         tab/pane descendants. Never binds to the first partial title match;
         the ``probe_role`` must resolve inside the candidate.
         """
-        deadline = time.monotonic() + self.settings.window_timeout
+        deadline = time.monotonic() + (timeout or self.settings.window_timeout)
         while time.monotonic() < deadline:
             # 1) top-level dialogs (e.g. 'Terms of payment', 'VATs')
             for win in self.app.desktop.windows():
@@ -501,12 +536,47 @@ def stabilize_active_editor(
                 main.set_focus()
             time.sleep(0.2)
 
-            # Traverse the form to trigger lazy layout.
+            # 2. Click the editor body composite to trigger SWT lazy layout.
+            clicked = False
+            try:
+                body = _editor_body(main)
+                if body is not None:
+                    rect = body.rectangle()
+                    main.click_input(
+                        coords=(
+                            rect.left + int(rect.width() * 0.3),
+                            rect.top + min(120, int(rect.height() * 0.3)),
+                        )
+                    )
+                    clicked = True
+            except Exception:
+                pass
+            if not clicked:
+                # Fallback 1: click just below the header row (the wide Edit
+                # that is reliably rendered at the top of a fresh editor).
+                try:
+                    for c in main.descendants(control_type="Edit"):
+                        r = c.rectangle()
+                        if r.top < 200 and r.left > 500 and r.width() > 300:
+                            main.click_input(coords=(r.left + 150, r.bottom + 25))
+                            clicked = True
+                            break
+                except Exception:
+                    pass
+            if not clicked:
+                # Fallback 2: generic point inside the editor area.
+                try:
+                    main.click_input(coords=(600, 250))
+                except Exception:
+                    pass
+            time.sleep(0.25)
+
+            # 3. Traverse the form to trigger lazy layout.
             for _ in range(8):
                 main.type_keys("{TAB}", pause=0.03)
             time.sleep(0.3)
 
-            # Section instantiated?
+            # 4. Section instantiated?
             if _has_section(main, wait_control):
                 try:
                     main.type_keys("^{HOME}", pause=0.05)

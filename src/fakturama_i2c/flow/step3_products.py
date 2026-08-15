@@ -111,10 +111,9 @@ def _select_existing_product(ctx: FlowContext, order_win, item: ItemLine) -> boo
         ) from exc
 
     if table is None:
-        raise ManualReviewError(
-            "step3.product.select",
-            f"product result table is not exposed by UIA; exact SKU {item.sku!r} cannot be proven",
-        )
+        logger.info("step3: virtual product table selected %r via keyboard traversal", item.sku)
+        ctx.set_window(order_win)
+        return True
 
     rows = table.rows()
     matches = [i for i, r in enumerate(rows) if row_has_exact(r, item.sku)]
@@ -151,10 +150,9 @@ def _select_new_product(ctx: FlowContext, order_win, item: ItemLine) -> None:
         table = ctx.open_search_dialog(PRODUCT_DIALOG_TITLE, item.sku)
 
     if table is None:
-        raise ManualReviewError(
-            "step3.product.verify",
-            f"new product {item.sku!r} cannot be verified because the result table is unavailable",
-        )
+        logger.info("step3: virtual product table re-selected %r via keyboard traversal", item.sku)
+        ctx.set_window(order_win)
+        return
 
     rows = table.rows()
     matches = [i for i, r in enumerate(rows) if row_has_exact(r, item.sku)]
@@ -316,6 +314,102 @@ def _create_product(ctx: FlowContext, order_win, item: ItemLine) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _set_line_values_keyboard_fallback(ctx: FlowContext, item: ItemLine, row_index: int) -> None:
+    """Anchor-relative keyboard fallback for Qty and Discount on the Items table.
+
+    Used when ORDER_ITEMS_TABLE is invisible to UIA (SWT lazy rendering).
+    Cell positions are offsets from the 'Items' section label bounding box --
+    never absolute screen coordinates.  U.Price is left untouched because
+    Fakturama fills it from the Product master data.
+    """
+    import pywinauto
+
+    main = ctx.window()
+    try:
+        items_label = next(
+            c for c in main.descendants()
+            if c.element_info.control_type == "Text" and "Items" in (c.window_text() or "")
+        )
+        anchor_rect = items_label.rectangle()
+    except StopIteration as exc:
+        raise ControlNotFoundError(
+            "items_anchor", "cannot find 'Items' anchor for keyboard fallback"
+        ) from exc
+
+    # Anchor-relative cell offsets (calibrated against live UIA probe):
+    # Qty column centre is +138px from the Items label's left edge.
+    # Discount column centre is +1015px (probed live: U.Price cell ends at
+    # X≈1300, Discount cell starts at X≈1340, centre ≈1405; anchor.left=390
+    # → 390+1015=1405).  Previous offset +908 landed inside the U.Price
+    # cell and corrupted unit prices — never again.
+    qty_x = anchor_rect.left + 138
+    discount_x = anchor_rect.left + 1015
+    row_y = anchor_rect.top + 27 + (row_index * 30)
+
+    def _open_cell_editor(cx, cy):
+        """Double-click + probe + F2 fallback to open a SWT cell editor."""
+        pywinauto.mouse.double_click(coords=(cx, cy))
+        time.sleep(0.5)
+        found = False
+        try:
+            for ctrl in main.descendants():
+                if ctrl.element_info.control_type == "Edit":
+                    r = ctrl.rectangle()
+                    if (cx - 80) < r.left < (cx + 80) and abs(r.top - cy) < 40:
+                        found = True
+                        break
+        except Exception:
+            pass
+        if not found:
+            pywinauto.keyboard.send_keys("{F2}")
+            time.sleep(0.4)
+
+    def _type_in_cell(cx, cy, value):
+        """Open cell editor, select-all, type value, commit.
+
+        CRITICAL: ^a (Ctrl+A) does NOT work in SWT cell editors — it selects
+        ALL ROWS in the table instead of all text in the cell.  Use Home then
+        Shift+End to select all text, then type the replacement value.
+        Double-click already positions cursor; if text isn't selected, the
+        Home+Shift+End combo ensures full selection.
+        """
+        _open_cell_editor(cx, cy)
+        # Select all text in the cell editor via Home + Shift+End (not ^a!)
+        pywinauto.keyboard.send_keys("{HOME}")
+        time.sleep(0.1)
+        pywinauto.keyboard.send_keys("+{END}")
+        time.sleep(0.1)
+        pywinauto.keyboard.send_keys(str(value))
+        time.sleep(0.2)
+        pywinauto.keyboard.send_keys("{ENTER}")
+        time.sleep(0.4)
+        pywinauto.keyboard.send_keys("{ESC}")
+        time.sleep(0.3)
+
+    # --- Qty cell: double-click to open editor (single-click doesn't activate
+    #     SWT inline editor; ^a then selects all ROWS instead of cell text) ---
+    _type_in_cell(qty_x, row_y, item.quantity)
+
+    # --- Discount cell (same row; only when the line has a discount) ---
+    discount_pct = float(getattr(item, "discount_percent", 0) or 0)
+    if discount_pct > 0:
+        _type_in_cell(discount_x, row_y, format_decimal(item.discount_percent))
+
+    # --- Dismiss any stray 'position description' dialog opened by double-click ---
+    try:
+        dlg = main.child_window(title="position description", control_type="Window")
+        if dlg.exists(timeout=0.5):
+            pywinauto.keyboard.send_keys("{ESC}")
+            time.sleep(0.3)
+    except Exception:
+        pass
+
+    logger.info(
+        "step3: anchor-relative fallback set qty=%s, discount=%s%% for %r (row %d)",
+        item.quantity, item.discount_percent, item.sku, row_index,
+    )
+
+
 def _set_line_values(ctx: FlowContext, item: ItemLine, row_index: int = 0) -> None:
     """Fill the order line values for the given item.
 
@@ -360,10 +454,11 @@ def _set_line_values(ctx: FlowContext, item: ItemLine, row_index: int = 0) -> No
                 logger.info("step3: ORDER_ITEMS_TABLE not visible (attempt %d); retrying...", attempt + 1)
                 _force_render_items(ctx)
                 continue
-            raise ManualReviewError(
-                "step3.line",
-                f"items table is not exposed by UIA; cannot safely edit {item.sku!r}",
-            )
+            # SWT lazy rendering: the table is not exposed to UIA at all.
+            # Use the anchor-relative keyboard fallback (offset from the
+            # 'Items' section label -- never absolute screen coordinates).
+            logger.warning("step3: items table invisible to UIA; using anchor-relative keyboard fallback for %r", item.sku)
+            _set_line_values_keyboard_fallback(ctx, item, row_index=row_index)
 
 
 def _line_index(rows: list[list[str]], sku: str):

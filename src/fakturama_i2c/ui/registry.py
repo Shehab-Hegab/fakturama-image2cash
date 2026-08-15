@@ -344,9 +344,11 @@ def default_registry() -> dict[str, Role]:
         ).add(Strategy("auto_id", "2688134")).add(Strategy("name", "Total", regex=True)),
 
         # -- Invoice editor ----------------------------------------------------
+        # The payment-method ComboBox has NO name in many Fakturama builds;
+        # we fall back to a positional strategy below.
         "INVOICE_PAYMENT_METHOD": Role("INVOICE_PAYMENT_METHOD").add(
             Strategy("name", "Payment", regex=True),
-        ),
+        ).add(Strategy("control_type", "ComboBox", require_unique=False)),
         "INVOICE_PAID_STATUS": Role("INVOICE_PAID_STATUS").add(
             Strategy("name", "Paid", regex=True),
         ).add(Strategy("name", r"(?i).*paid.*", regex=True)),
@@ -357,8 +359,9 @@ def default_registry() -> dict[str, Role]:
         ).add(Strategy("name", r"(?i).*paid.*", regex=True)),
         "INVOICE_PAYMENT_DATE": Role("INVOICE_PAYMENT_DATE").add(
             Strategy("name", "Payment date", regex=True),
-        ).add(Strategy("name", r"(?i)pay.*date|date", regex=True)).add(
-            Strategy("control_type", "Edit", name_filter="Date", require_unique=False),
+        ).add(Strategy("name", r"(?i)^payment\s+date$", regex=True)),
+        "INVOICE_PAYMENT_DATE_LABEL": Role("INVOICE_PAYMENT_DATE_LABEL").add(
+            Strategy("name", "Payment date", regex=True),
         ),
         "INVOICE_PAYMENT_VALUE": Role("INVOICE_PAYMENT_VALUE").add(
             Strategy("name", "Value", regex=True),

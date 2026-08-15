@@ -32,7 +32,10 @@ def capture_window(
     png = out_dir / f"{safe}.png"
     txt = out_dir / f"{safe}.elements.txt"
     try:
-        window.capture_as_image().save(str(png))
+        image = window.capture_as_image()
+        if image is None:
+            raise RuntimeError("capture_as_image() returned None (window not renderable)")
+        image.save(str(png))
         logger.info("screenshot saved: %s", png)
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("screenshot failed: %s", exc)
