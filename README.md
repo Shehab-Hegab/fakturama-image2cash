@@ -144,6 +144,21 @@ region to its flow step ship in the repo:
 
 Regenerate them at any time with `python scripts/make_demo_assets.py`.
 
+## Evidence and verification status
+
+The source-order evidence is captured at
+[`assets/screenshots/01_source_order.png`](assets/screenshots/01_source_order.png).
+The live Fakturama attempt attached to the running application but the desktop
+session rejected Windows input injection before the Order header could be
+written; it did not create records or fabricate proof screenshots. See the
+honest, reproducible results in
+[`E2E_VERIFICATION_REPORT.md`](E2E_VERIFICATION_REPORT.md). In an interactive
+Windows session that permits UI input, the flow writes these evidence files:
+
+- `screenshots/02_saved_order.png`
+- `screenshots/03_linked_paid_invoice.png`
+- `screenshots/04_documents_final_state.png`
+
 ## Running the tests
 
 ```powershell

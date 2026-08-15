@@ -36,9 +36,9 @@ Reads back the persisted state (Data > Documents list, and the Open Order form) 
 
 ### 2.5 Safety net
 
-- **Checkpointing:** each of the five flow phases logs a checkpoint; on restart the automation resumes from the last checkpoint rather than replaying the whole flow.
+- **Checkpoint logging:** each of the five flow phases logs a checkpoint for diagnostics. Automatic resume is a planned improvement, not a current claim.
 - **Screenshots on failure:** every `ManualReviewError` and unexpected exception captures a full-screen and active-window screenshot plus a UIA element dump into a run artifacts folder.
-- **Idempotent save:** save operations re-read the form before writing; re-running a phase against already-written data produces no duplicate records.
+- **Fail-closed save:** the flow saves only after its preconditions and arithmetic checks pass. Re-run deduplication is a planned improvement, so an interrupted run is reviewed rather than replayed blindly.
 - **Controlled timeouts:** all waits bound by explicit timeouts so a hung dialog fails fast into the manual-review path.
 
 ## 3. Control-Discovery and Grounding Strategy

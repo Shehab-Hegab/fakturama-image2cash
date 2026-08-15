@@ -8,6 +8,7 @@ coordinates or layout.
 
 from __future__ import annotations
 
+import time
 from datetime import date
 from decimal import Decimal
 from typing import Any, Optional, Sequence
@@ -91,6 +92,12 @@ class Edit(Control):
 
     def fill(self, text: Any) -> None:
         try:
+            # Ensure focus before setting text — SWT Edits may silently
+            # ignore set_edit_text on an unfocused control.
+            try:
+                self.ctrl.set_focus()
+            except Exception:
+                pass
             self.ctrl.set_edit_text("" if text is None else str(text))
         except Exception:
             try:
@@ -122,25 +129,57 @@ class Combo(Control):
             return self.items()[0] if self.items() else ""
 
     def select(self, text: str) -> None:
-        # SWT ComboBoxes expose no reliable item list via UIA texts()/items()
-        # (item_count() can differ from texts()); try the direct UIA select
-        # first, fall back to an items-based exact match, then manual review.
+        """Select combo item via resilient keyboard navigation (SWT-safe).
+
+        pywinauto's UIA ``select()`` takes no positional argument on SWT
+        ComboBoxes, so the direct call is a no-op at best.  The keyboard path
+        (focus -> click -> type text -> ENTER) is the standard SWT-compatible
+        approach; a text-scan arrow traversal is used as a fallback.
+        """
+        if not text:
+            return
+
+        # Path 1: keyboard type-ahead (works on SWT ComboBox / CCombo).
         try:
-            self.ctrl.select(str(text))
+            self.ctrl.set_focus()
+            time.sleep(0.15)
+            self.ctrl.click_input()
+            time.sleep(0.25)
+            self.ctrl.type_keys(str(text), with_spaces=True, pause=0.02)
+            time.sleep(0.2)
+            self.ctrl.type_keys("{ENTER}")
             return
         except Exception:
             pass
-        items = self.items()
-        exact = [i for i in items if (i or "").strip().lower() == (text or "").strip().lower()]
-        if not exact:
-            raise ManualReviewError(
-                "combo.select",
-                f"value {text!r} not in combo items {items!r}",
-            )
+
+        # Path 2: scan items and traverse with arrow keys.
         try:
-            self.ctrl.select(exact[0])
+            items = self.items()
+            exact = [i for i in items if (i or "").strip().lower() == (text or "").strip().lower()]
+            if not exact and items:
+                exact = [i for i in items if (text or "").strip().lower() in (i or "").strip().lower()]
+            if not exact:
+                raise ManualReviewError(
+                    "combo.select",
+                    f"value {text!r} not in combo items {items!r}",
+                )
+            self.ctrl.set_focus()
+            self.ctrl.click_input()
+            time.sleep(0.2)
+            self.ctrl.type_keys("{HOME}")
+            time.sleep(0.1)
+            for _ in range(len(items) if items else 10):
+                current = self.ctrl.selected_text() if hasattr(self.ctrl, "selected_text") else None
+                if current and text.strip().lower() in (current or "").strip().lower():
+                    self.ctrl.type_keys("{ENTER}")
+                    return
+                self.ctrl.type_keys("{DOWN}")
+                time.sleep(0.08)
+            self.ctrl.type_keys("{ENTER}")
+        except ManualReviewError:
+            raise
         except Exception as exc:
-            raise ControlNotFoundError("combo.select", str(exc)) from exc
+            raise ControlNotFoundError("combo.select", f"Failed selecting '{text}': {exc}") from exc
 
     def select_or_clear(self, text: str) -> None:
         """Select if present, else clear -- used for payment-method codes."""
@@ -162,10 +201,16 @@ class Combo(Control):
 
 class Button(Control):
     def click(self) -> None:
-        try:
-            self.ctrl.click()
-        except Exception as exc:
-            raise ControlNotFoundError("button.click", str(exc)) from exc
+        last_exc: Optional[Exception] = None
+        for method_name in ("click", "click_input", "invoke"):
+            method = getattr(self.ctrl, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                    return
+                except Exception as exc:
+                    last_exc = exc
+        raise ControlNotFoundError("button.click", str(last_exc or "no clickable method found"))
 
     def enabled(self) -> bool:
         try:

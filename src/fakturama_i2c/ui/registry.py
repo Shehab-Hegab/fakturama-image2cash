@@ -272,8 +272,10 @@ def default_registry() -> dict[str, Role]:
             Strategy("name", "Description", regex=True),
         ),
         "PRODUCT_PRICE_GROSS": Role("PRODUCT_PRICE_GROSS").add(
-            Strategy("name", "Price (gross)", regex=True),
-        ).add(Strategy("name", "Price", regex=True)),
+            Strategy("name", r"Price \(gross\)", regex=True),
+        ).add(Strategy("name", r"(?i)price.*gross", regex=True)).add(
+            Strategy("name", r"(?i)^price$", regex=True)
+        ),
         "PRODUCT_COST_PRICE": Role("PRODUCT_COST_PRICE").add(
             Strategy("name", "cost price", regex=True),
         ),
@@ -301,11 +303,17 @@ def default_registry() -> dict[str, Role]:
             Strategy("name", "Standard VAT", regex=True),
         ),
         "VAT_NEW_BUTTON": Role("VAT_NEW_BUTTON").add(
-            Strategy("control_type", "Button"),
-        ).add(Strategy("name", "New", regex=True)),
+            Strategy("name", r"(?i)create.*new.*tax", regex=True),
+        ).add(
+            Strategy("name", r"(?i)create.*tax", regex=True),
+        ).add(
+            Strategy("control_type", "Button", in_ancestor="VATs", ancestor_kind="name"),
+        ),
 
         # -- Order body -------------------------------------------------------
         "ORDER_ITEMS_TABLE": Role("ORDER_ITEMS_TABLE").add(
+            Strategy("control_type", "Table", in_ancestor="Items", ancestor_kind="name", require_unique=False),
+        ).add(
             Strategy("control_type", "Table"),
         ).add(Strategy("class", "SWT.Table")),
         "ORDER_DISCOUNT": Role("ORDER_DISCOUNT").add(
@@ -313,17 +321,24 @@ def default_registry() -> dict[str, Role]:
         ).add(Strategy("name", "Discount", regex=True)),
         "ORDER_SHIPPING": Role("ORDER_SHIPPING").add(
             Strategy("auto_id", "2753640"),
-        ).add(Strategy("name", "Shipping", regex=True)),
+        ).add(Strategy("control_type", "ComboBox", name_filter="Shipping", require_unique=False)).add(
+            Strategy("name", "Shipping", regex=True),
+        ),
+        "ORDER_SHIPPING_LABEL": Role("ORDER_SHIPPING_LABEL").add(
+            Strategy("name", "Shipping", regex=True),
+        ),
         "ORDER_TOTAL_NET": Role("ORDER_TOTAL_NET").add(
             Strategy("auto_id", "4065694"),
         ).add(Strategy("name", "Total Gross", regex=True)).add(Strategy("name", "Total Net", regex=True)),
-        # Totals VAT is the only Edit named 'VAT' (the VAT-mode ComboBox is a
-        # ComboBox, excluded by the Edit control_type filter).
+        # Totals VAT: prefer a strict 'Total VAT'-style label (avoids matching
+        # the 5+ line-table 'VAT' header cells); keep auto_id + Edit fallbacks.
         "ORDER_TOTAL_VAT": Role("ORDER_TOTAL_VAT").add(
-            Strategy("control_type", "Edit", name_filter="VAT"),
-        ).add(Strategy("auto_id", "462516")).add(
-            Strategy("name", "VAT", regex=True)
-        ).add(Strategy("name", "Total VAT", regex=True)),
+            Strategy("name", r"(?i)^total\s+v\s*a\s*t$", regex=True),
+        ).add(Strategy("name", r"(?i)vat.*total", regex=True)).add(
+            Strategy("auto_id", "462516"),
+        ).add(Strategy("name", "VAT", regex=True)).add(
+            Strategy("name", "Total VAT", regex=True),
+        ).add(Strategy("control_type", "Edit", name_filter="VAT", require_unique=False)),
         "ORDER_TOTAL": Role("ORDER_TOTAL").add(
             Strategy("control_type", "Edit", name_filter="Total"),
         ).add(Strategy("auto_id", "2688134")).add(Strategy("name", "Total", regex=True)),
@@ -334,12 +349,21 @@ def default_registry() -> dict[str, Role]:
         ),
         "INVOICE_PAID_STATUS": Role("INVOICE_PAID_STATUS").add(
             Strategy("name", "Paid", regex=True),
-        ),
+        ).add(Strategy("name", r"(?i).*paid.*", regex=True)),
+        "INVOICE_PAID_CHECKBOX": Role("INVOICE_PAID_CHECKBOX").add(
+            Strategy("name", r"(?i)^paid$", regex=True),
+        ).add(Strategy("control_type", "CheckBox", name_filter="paid")).add(
+            Strategy("control_type", "Button", name_filter="paid"),
+        ).add(Strategy("name", r"(?i).*paid.*", regex=True)),
         "INVOICE_PAYMENT_DATE": Role("INVOICE_PAYMENT_DATE").add(
             Strategy("name", "Payment date", regex=True),
+        ).add(Strategy("name", r"(?i)pay.*date|date", regex=True)).add(
+            Strategy("control_type", "Edit", name_filter="Date", require_unique=False),
         ),
         "INVOICE_PAYMENT_VALUE": Role("INVOICE_PAYMENT_VALUE").add(
             Strategy("name", "Value", regex=True),
+        ).add(Strategy("name", r"(?i)value|amount|total", regex=True)).add(
+            Strategy("control_type", "Edit", name_filter="Value", require_unique=False),
         ),
 
         # -- common ------------------------------------------------------------
@@ -361,17 +385,12 @@ def default_registry() -> dict[str, Role]:
         "FOLLOW_UP_INVOICE": Role("FOLLOW_UP_INVOICE").add(
             Strategy(
                 "name",
-                r"(?i)invoice",
+                r"(?i)^invoice$",
                 regex=True,
                 in_ancestor="Create a follow-up document",
                 ancestor_kind="name",
             ),
-        ).add(Strategy(
-            "control_type",
-            "Button",
-            in_ancestor="Create a follow-up document",
-            ancestor_kind="name",
-        )).add(Strategy("name", r"(?i)follow.?up.*invoice", regex=True)),
+        ),
         "MENU_DATA": Role("MENU_DATA").add(
             Strategy("name", "Data", regex=True),
         ),
@@ -484,6 +503,12 @@ class ControlFinder:
         pywinauto API that returns the matching controls themselves (a list of
         wrapper objects). This is deliberately NOT ``child_window(...).children()``
         which resolves the *last* match and returns *its* children.
+
+        When an ``in_ancestor`` strategy targets a leaf label (e.g. a Text
+        "Items" whose sibling controls are Images), the initial ``descendants()``
+        call returns empty.  We then walk up to the parent Pane and retry --
+        this handles the common SWT pattern where a section label and its
+        interactive icons are siblings inside a container Pane.
         """
         scope = window
         if strategy.in_ancestor:
@@ -492,16 +517,30 @@ class ControlFinder:
                 return []
             scope = ancestor
         kwargs = strategy.to_child_window_kwargs()
+        results = self._descendants_of(scope, kwargs)
+        # Fallback: if scope is a leaf label (Text/Static), walk up to its
+        # parent container where sibling controls live.
+        if not results and strategy.in_ancestor:
+            try:
+                parent = scope.parent()
+                if parent is not None:
+                    results = self._descendants_of(parent, kwargs)
+            except Exception:
+                pass
+        results = [r for r in results if self._visible(r)]
+        return results
+
+    @staticmethod
+    def _descendants_of(scope, kwargs: dict[str, Any]) -> list[Any]:
+        """Run ``scope.descendants(**kwargs)`` with TypeError fallback."""
         try:
-            results = list(scope.descendants(**kwargs))
+            return list(scope.descendants(**kwargs))
         except TypeError:
             # Some wrappers expose descendants() without criteria kwargs.
             results = list(scope.descendants())
-            results = [r for r in results if self._criteria_match(r, kwargs)]
+            return [r for r in results if ControlFinder._criteria_match(r, kwargs)]
         except Exception:
             return []
-        results = [r for r in results if self._visible(r)]
-        return results
 
     def _find_ancestor(self, window, strategy: Strategy) -> Optional[Any]:
         kwargs = (
@@ -509,10 +548,27 @@ class ControlFinder:
             if strategy.ancestor_kind == "name"
             else {"auto_id": strategy.in_ancestor}
         )
+        # Strategy 1: child_window — fast, works for unambiguous titles.
         try:
             spec = window.child_window(**kwargs)
             if spec.exists(timeout=0.5):
                 return spec
+        except Exception:
+            pass
+        # Strategy 2: descendants fallback — handles ambiguous matches
+        # (e.g. title "VATs" matches both TabItem, Tab, and Pane).
+        # Prefer Pane container types over Tab/TabItem since content lives
+        # in Panes.
+        try:
+            matches = list(window.descendants(**kwargs))
+            if matches:
+                panes = [
+                    m for m in matches
+                    if (m.element_info.control_type or "").lower() in ("pane", "panel", "group", "section")
+                ]
+                if panes:
+                    return panes[0]
+                return matches[0]
         except Exception:
             pass
         return None

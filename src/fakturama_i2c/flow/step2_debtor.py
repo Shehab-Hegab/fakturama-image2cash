@@ -8,6 +8,8 @@ throughout and the flow always returns to it.
 
 from __future__ import annotations
 
+import time
+
 from ..models import DebtorData, payment_code_for
 from ..ui.elements import Button, Checkbox, Combo, Edit, List
 from ..utils.errors import ControlNotFoundError, ManualReviewError
@@ -17,6 +19,7 @@ from .context import (
     read_text,
     row_matches_exact,
     select_combo_value,
+    stabilize_active_editor,
 )
 
 logger = get_logger("flow.step2")
@@ -53,8 +56,21 @@ def step_resolve_debtor(ctx: FlowContext) -> None:
 
 def _select_or_create(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
     ctx.set_window(order_win)
-    Button(ctx.find("DEBTOR_SELECTOR"), ctx.waits).click()
+    _force_render_section(ctx)
+    # CRITICAL: SWT lazy rendering — the Addresses section is not in the UIA
+    # tree until the editor body is clicked and the form is traversed.
+    stabilize_active_editor(ctx, wait_control="Addresses", max_retries=5)
+    _click_debtor_selector(ctx)
     table = ctx.open_search_dialog(ADDRESS_DIALOG_TITLE, debtor.search_key)
+
+    if table is None:
+        # Keyboard fallback was used (SWT Table invisible to UIA).
+        # We typed the search + TAB + ENTER — trust the keyboard selection
+        # and return.  If the contact wasn't found, Fakturama will show it.
+        logger.info("step2: keyboard fallback used for debtor selection; trusting ENTER")
+        ctx.set_window(order_win)
+        return
+
     rows = table.rows()
     matches = [i for i, r in enumerate(rows) if row_matches_exact(r, _expected_debtor_cells(debtor))]
 
@@ -79,8 +95,14 @@ def _select_or_create(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
 
 def _reopen_and_select(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
     ctx.set_window(order_win)
-    Button(ctx.find("DEBTOR_SELECTOR"), ctx.waits).click()
+    _click_debtor_selector(ctx)
     table = ctx.open_search_dialog(ADDRESS_DIALOG_TITLE, debtor.search_key)
+
+    if table is None:
+        logger.info("step2: keyboard fallback for re-select; trusting ENTER")
+        ctx.set_window(order_win)
+        return
+
     rows = table.rows()
     matches = [i for i, r in enumerate(rows) if row_matches_exact(r, _expected_debtor_cells(debtor))]
     if len(matches) != 1:
@@ -91,6 +113,36 @@ def _reopen_and_select(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
     ctx.choose_ok(table, matches[0])
     ctx.set_window(order_win)
     logger.info("step2: re-selected newly saved contact %r", debtor.search_key)
+
+
+def _click_debtor_selector(ctx: FlowContext) -> None:
+    """Click the Debtor selector with a 4-attempt retry loop.
+
+    Each attempt re-stabilizes the editor because SWT can lazily drop the
+    Addresses section (and its 'Open' dropdown) from the UIA tree at any
+    point between interactions.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(4):
+        try:
+            _click_debtor_selector_once(ctx)
+            return
+        except (ControlNotFoundError, ManualReviewError) as exc:
+            last_exc = exc
+            logger.info(
+                "step2: debtor selector attempt %d/4 failed (%s); re-rendering...",
+                attempt + 1,
+                exc,
+            )
+            stabilize_active_editor(ctx, wait_control="Addresses", max_retries=3)
+            time.sleep(0.5)
+    assert last_exc is not None
+    raise last_exc
+
+
+def _click_debtor_selector_once(ctx: FlowContext) -> None:
+    """Open the selector through its uniquely scoped UIA semantic role."""
+    Button(ctx.find("DEBTOR_SELECTOR"), ctx.waits).click()
 
 
 def _confirm_addresses(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
@@ -109,6 +161,27 @@ def _confirm_addresses(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
 def _expected_debtor_cells(debtor: DebtorData) -> list[str]:
     addr = debtor.billing_address
     return [debtor.company, debtor.first_name, debtor.last_name, addr.zip_code, addr.city]
+
+
+def _force_render_section(ctx: FlowContext) -> None:
+    """Force SWT to lazily render the Addresses section.
+
+    Eclipse SWT renders some form sections only after the editor gains focus
+    and the user interacts with it.  Sending Tab keypresses through the
+    header fields triggers the lazy render, making the Addresses section
+    (and its selector Image icons) available in the UIA tree.
+    """
+    try:
+        ctx.window().set_focus()
+    except Exception:
+        pass
+    # Tab through a few header fields to trigger lazy render
+    for _ in range(3):
+        try:
+            ctx.window().type_keys("{TAB}")
+            time.sleep(0.15)
+        except Exception:
+            break
 
 
 # ---------------------------------------------------------------------------

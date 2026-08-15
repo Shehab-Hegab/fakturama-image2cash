@@ -16,7 +16,7 @@ from ..extraction.extractor import Extractor, ExtractionReport
 from ..ui.app import AppController
 from ..ui.registry import ControlFinder
 from ..ui.waits import Waits
-from ..utils.errors import I2CError
+from ..utils.errors import ControlNotFoundError, FlowTimeoutError, I2CError, ManualReviewError
 from ..utils.logging import get_logger
 from ..utils.screenshot import capture_window
 from .context import FlowContext
@@ -52,6 +52,18 @@ def run_flow(settings: Settings, image_path, launch: bool = False) -> Extraction
     ``launch`` propagates to :meth:`AppController.connect` so the CLI's
     ``--launch`` flag also applies to the main flow, not just verification.
     """
+    import shutil
+    src_p = Path(image_path)
+    root_dir = Path(__file__).resolve().parent.parent.parent
+    root_sc = root_dir / "screenshots"
+    root_sc.mkdir(parents=True, exist_ok=True)
+    if src_p.exists():
+        try:
+            shutil.copyfile(src_p, root_sc / "01_source_order.png")
+            shutil.copyfile(src_p, settings.screenshot_dir / "01_source_order.png")
+        except Exception as exc:
+            logger.debug("could not copy source order screenshot: %s", exc)
+
     report = run_extract(settings, image_path)
     ctx = FlowContext(
         settings=settings,

@@ -23,7 +23,7 @@ from ..ui.app import AppController
 from ..ui.elements import Button, Combo, Dialog, Edit, Menu, Table, parse_decimal
 from ..ui.registry import ControlFinder, matches_exact
 from ..ui.waits import Waits
-from ..utils.errors import ControlNotFoundError, ManualReviewError
+from ..utils.errors import ControlNotFoundError, FlowTimeoutError, ManualReviewError
 from ..utils.logging import get_logger
 
 logger = get_logger("flow.context")
@@ -75,8 +75,23 @@ class FlowContext:
         self._current_window = window
 
     def find(self, role: str) -> Any:
-        """Resolve ``role`` inside the current window."""
-        return self.finder.resolve(self.window(), role)
+        """Resolve ``role`` inside the current window.
+
+        If the current window (an editor Pane) cannot find the role, falls
+        back to the main window.  This handles SWT lazy-rendered sections
+        (Addresses, Items, etc.) whose ancestor labels are only discoverable
+        from the full main-window tree rather than a Pane wrapper.
+        """
+        try:
+            return self.finder.resolve(self.window(), role)
+        except (ControlNotFoundError, ManualReviewError):
+            try:
+                main = self.app.main_window()
+            except Exception:
+                raise
+            if id(main) != id(self.window()):
+                return self.finder.resolve(main, role)
+            raise
 
     def resolve_window(self, role: str) -> Optional[Any]:
         """Return an open window whose title hints at ``role``'s editor, else None."""
@@ -104,14 +119,165 @@ class FlowContext:
 
     # -- shared UI patterns ---------------------------------------------------
 
-    def open_search_dialog(self, dialog_title: str, search_text: str) -> Table:
-        """Wait for a select dialog, search it, and return the stabilized table."""
-        win = self.waits.for_window(self.app.desktop, dialog_title, self.settings.window_timeout)
+    def open_search_dialog(self, dialog_title: str, search_text: str) -> Any:
+        """Wait for a select dialog, search it, and return the stabilized table.
+
+        Fakturama's select dialogs (e.g. "Select a product", "Select the
+        address") are **Eclipse SWT modal child dialogs** that may not appear
+        as top-level desktop windows.  ``for_window`` only scans top-level
+        windows, so when it times out we fall back to scanning the main
+        window's ``descendants()`` for a control whose ``window_text()``
+        matches ``dialog_title``.
+
+        When RESULT_TABLE (SWT Table) is invisible to UIA, falls back to
+        keyboard-based selection: type in SEARCH_EDIT → TAB to first row →
+        ENTER to confirm.
+        """
+        try:
+            win = self.waits.for_window(self.app.desktop, dialog_title, self.settings.window_timeout)
+        except FlowTimeoutError:
+            # Fallback 1: find a modal child dialog inside the main window.
+            try:
+                win = self._find_child_dialog(dialog_title)
+            except FlowTimeoutError:
+                # Fallback 2: scan all top-level windows for the dialog
+                # (Eclipse SWT modal dialogs may not be desktop.window() children)
+                win = self._find_pid_dialog(dialog_title)
         self.set_window(win)
-        self.waits.stable_snapshot(self.find("RESULT_TABLE"))
-        Edit(self.find("SEARCH_EDIT"), self.waits).fill(search_text)
-        self.waits.stable_snapshot(self.find("RESULT_TABLE"))
-        return Table(self.find("RESULT_TABLE"), self.waits)
+
+        # Try standard approach: find RESULT_TABLE and SEARCH_EDIT
+        try:
+            self.waits.stable_snapshot(self.find("RESULT_TABLE"))
+            Edit(self.find("SEARCH_EDIT"), self.waits).fill(search_text)
+            self.waits.stable_snapshot(self.find("RESULT_TABLE"))
+            return Table(self.find("RESULT_TABLE"), self.waits)
+        except ControlNotFoundError:
+            pass
+
+        # Fallback: RESULT_TABLE invisible to UIA (SWT lazy rendering).
+        # Use keyboard: type search → DOWN arrow to first row → ENTER to select.
+        # NOTE: {TAB} in SWT dialogs moves focus to OK/Cancel buttons, NOT the
+        # table. The {DOWN} arrow moves focus directly into the first row.
+        logger.info("open_search_dialog: RESULT_TABLE invisible, using keyboard fallback ({DOWN}{ENTER})")
+        # Stage 1: type the search term — a failure HERE is real and fatal.
+        try:
+            search_edit = self.find("SEARCH_EDIT")
+            Edit(search_edit, self.waits).fill(search_text)
+            time.sleep(0.5)
+        except Exception as exc:
+            raise ManualReviewError(
+                "search_dialog.keyboard",
+                f"keyboard fallback for '{dialog_title}' failed at SEARCH_EDIT stage: {exc}",
+            ) from exc
+        # Stage 2: SWT virtual tables do not expose rows through UIA.  The
+        # documented, layout-independent traversal is search -> DOWN -> ENTER.
+        # This deliberately never synthesizes a mouse coordinate.
+        try:
+            win.set_focus()
+            time.sleep(0.2)
+            win.type_keys("{DOWN}")
+            time.sleep(0.3)
+            win.type_keys("{ENTER}")
+        except Exception as exc:
+            raise ManualReviewError(
+                "search_dialog.keyboard",
+                f"keyboard selection for '{dialog_title}' failed: {exc}",
+            ) from exc
+        time.sleep(0.5)
+        return None  # Caller must handle None return (table not readable)
+
+    def _find_child_dialog(self, dialog_title: str):
+        """Scan main-window descendants for a dialog whose title matches.
+
+        Returns the **container** (Pane / Window / Dialog) that holds the
+        title label — NOT the title-text element itself, because
+        ``descendants(control_type="Table")`` on a Text element yields nothing.
+        """
+        import time as _time
+        from ..utils.errors import FlowTimeoutError as _FTE
+        main = self.app.main_window()
+        deadline = _time.monotonic() + self.settings.window_timeout
+        title_lower = dialog_title.lower()
+        while _time.monotonic() < deadline:
+            try:
+                # Collect ALL descendants whose window_text matches.
+                matches = []
+                for desc in main.descendants():
+                    try:
+                        wt = (desc.window_text() or "").strip()
+                        if wt and title_lower in wt.lower():
+                            matches.append(desc)
+                    except Exception:
+                        continue
+                # Prefer a container (has children) over a leaf text element.
+                for m in matches:
+                    try:
+                        ct = getattr(getattr(m, "element_info", None), "control_type", "")
+                    except Exception:
+                        ct = ""
+                    if ct in ("Pane", "Window", "Dialog", "TabItem", "Tab"):
+                        return m
+                # No container found — try the parent of the first leaf match.
+                for m in matches:
+                    try:
+                        parent = m.parent()
+                        if parent is not None:
+                            return parent
+                    except Exception:
+                        pass
+                # Last resort: return whatever we found (will fail later with
+                        # a clear RESULT_TABLE error instead of a silent hang).
+                if matches:
+                    return matches[0]
+            except Exception:
+                pass
+            _time.sleep(0.5)
+        raise _FTE(
+            f"window '{dialog_title}'",
+            "not found as top-level window or modal child of main window",
+        )
+
+    def _find_pid_dialog(self, dialog_title: str):
+        """Scan top-level desktop windows matching the Fakturama PID and title.
+
+        Eclipse SWT/RCP modal dialogs are real top-level windows but may not
+        be found by ``desktop.window(title_re=...)`` due to timing.  This
+        method enumerates ALL desktop windows and checks both the title and
+        the owning process ID.
+        """
+        import time as _time
+        from ..utils.errors import FlowTimeoutError as _FTE
+        try:
+            target_pid = self.app.app.process  # pywinauto Application PID
+        except Exception:
+            target_pid = None
+        deadline = _time.monotonic() + self.settings.window_timeout
+        title_lower = dialog_title.lower()
+        while _time.monotonic() < deadline:
+            for win in self.app.desktop.windows():
+                try:
+                    wt = (win.window_text() or "").strip()
+                    if not wt:
+                        continue
+                    # Title match (case-insensitive substring)
+                    if title_lower not in wt.lower():
+                        continue
+                    # PID match (if we know it)
+                    if target_pid is not None:
+                        try:
+                            w_pid = win.process_id()
+                            if w_pid != target_pid:
+                                continue
+                        except Exception:
+                            pass
+                    return win
+                except Exception:
+                    continue
+            _time.sleep(0.5)
+        raise _FTE(
+            f"window '{dialog_title}'",
+            "not found as top-level window, modal child, or PID dialog",
+        )
 
     def cancel_dialog(self) -> None:
         """Close the current dialog via Cancel, falling back to a hard close."""
@@ -121,20 +287,67 @@ class FlowContext:
             Dialog(self.window(), self.waits).close()
 
     def menu_select(self, top_role: str, item_role: str, item_text: str) -> None:
-        """Pick ``item_text`` under the ``top_role`` menu (with click fallbacks)."""
-        win = self.window()
-        try:
-            Menu(self._resolve_anywhere(win, top_role), self.waits).select_item(item_text)
-            return
-        except Exception as exc:  # SWT menus rarely expose menu_select
-            logger.debug("menu_select(%r) failed: %s", item_text, exc)
+        """Pick ``item_text`` under the ``top_role`` menu (with click fallbacks).
+
+        Uses multiple strategies because Eclipse SWT RCP MenuBar items are
+        often not accessible via pywinauto's built-in ``menu_select()`` or
+        ``Menu.select_item()``.
+        """
+        # Strategy 1: built-in menu_select on the main window (simplest path).
         try:
             self.app.main_window().menu_select(f"Data->{item_text}")
+            time.sleep(0.3)
             return
         except Exception as exc:
-            logger.debug("window.menu_select(%r) failed: %s", item_text, exc)
-        Button(self._resolve_anywhere(win, top_role), self.waits).click()
-        Button(self._resolve_anywhere(win, item_role), self.waits).click()
+            logger.debug("menu_select(path %r) failed: %s", item_text, exc)
+
+        # Strategy 2: bare menu_select (item only, no path).
+        try:
+            self.app.main_window().menu_select(item_text)
+            time.sleep(0.3)
+            return
+        except Exception as exc:
+            logger.debug("menu_select(bare %r) failed: %s", item_text, exc)
+
+        # Strategy 3: resolve the top-level MenuItem, click it, then click
+        # the sub-item by name once the menu popup expands.
+        win = self.window()
+        try:
+            top_ctrl = self._resolve_anywhere(win, top_role)
+            Button(top_ctrl, self.waits).click()
+            time.sleep(0.5)
+            # After the top menu expands, resolve the sub-item from the main
+            # window (the popup is a child of the main window).
+            item_ctrl = self._resolve_anywhere(self.app.main_window(), item_role)
+            Button(item_ctrl, self.waits).click()
+            time.sleep(0.3)
+            return
+        except Exception as exc:
+            logger.debug("menu_select(click %r) failed: %s", item_text, exc)
+
+        raise ControlNotFoundError(
+            "menu_select",
+            f"could not navigate to {item_text!r} under {top_role!r} "
+            "via UIA menu strategies (path, bare, click)",
+        )
+
+    def _find_nav_item(self, item_text: str):
+        """Find a Text control in Fakturama's left Navigation View by text."""
+        try:
+            main = self.app.main_window()
+            for ctrl in main.descendants(control_type="Text"):
+                try:
+                    wt = (ctrl.window_text() or "").strip()
+                    if wt.lower() == item_text.lower():
+                        rect = ctrl.rectangle()
+                        # Navigation panel items are in the left 383px
+                        if rect.left < 383 and rect.right < 400:
+                            return ctrl
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
 
     def save(self) -> None:
         """Click the current window's Save button."""
@@ -228,6 +441,92 @@ class FlowContext:
             return int(window.handle)
         except Exception:
             return None
+
+
+def _editor_body(win: Any):
+    """Return the largest editor-body Pane below the toolbar, else None.
+
+    Eclipse SWT renders the Order editor inside a Pane that spans the area
+    right of the Navigation view and below the toolbar (x > 380, y > 120).
+    Clicking it activates the ScrolledComposite so lazy sections render.
+    """
+    best, best_area = None, 0
+    try:
+        for ctrl in win.descendants(control_type="Pane"):
+            try:
+                rect = ctrl.rectangle()
+                area = rect.width() * rect.height()
+                if area > best_area and rect.top > 120 and rect.left > 380:
+                    best_area, best = area, ctrl
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return best
+
+
+def _has_section(win: Any, name: str) -> bool:
+    """True if any descendant's text matches ``name`` (case-insensitive)."""
+    pat = re.compile(r"(?i)" + re.escape(name))
+    try:
+        for ctrl in win.descendants():
+            try:
+                if pat.search(ctrl.window_text() or ""):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def stabilize_active_editor(
+    ctx: FlowContext,
+    wait_control: str = "Addresses",
+    max_retries: int = 5,
+) -> bool:
+    """Force Eclipse SWT to instantiate lazy composites (Addresses, Items, Totals).
+
+    SWT (ScrolledComposite / ExpandableComposite) only builds the UIA tree
+    nodes for a section after the editor gains focus. Keyboard traversal
+    triggers the lazy layout without relying on any screen coordinates.
+    """
+    main = ctx.app.main_window()
+    for attempt in range(max_retries):
+        try:
+            # 1. Focus the active editor window/pane.
+            try:
+                ctx.window().set_focus()
+            except Exception:
+                main.set_focus()
+            time.sleep(0.2)
+
+            # Traverse the form to trigger lazy layout.
+            for _ in range(8):
+                main.type_keys("{TAB}", pause=0.03)
+            time.sleep(0.3)
+
+            # Section instantiated?
+            if _has_section(main, wait_control):
+                try:
+                    main.type_keys("^{HOME}", pause=0.05)
+                except Exception:
+                    pass
+                time.sleep(0.2)
+                logger.info(
+                    "stabilize_active_editor: %r rendered after attempt %d",
+                    wait_control,
+                    attempt + 1,
+                )
+                return True
+        except Exception:
+            time.sleep(0.5)
+    logger.warning(
+        "stabilize_active_editor: %r NOT rendered after %d attempts",
+        wait_control,
+        max_retries,
+    )
+    return False
 
 
 def _title_hint(role: str) -> Optional[str]:

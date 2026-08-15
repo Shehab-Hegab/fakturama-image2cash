@@ -113,27 +113,44 @@ class Waits:
     # -- windows -------------------------------------------------------------
 
     def for_window(self, desktop, title: str, timeout: Optional[float] = None) -> Any:
-        """Wait until a top-level window whose title contains ``title`` exists."""
-        from pywinauto import timings
+        """Wait until a window whose title contains ``title`` exists.
 
+        Fakturama's select-dialogs (e.g. "Select a product", "Select the address")
+        are Eclipse SWT modal child dialogs. They ARE top-level windows (with their
+        own title bars), but ``desktop.window(title_re=...)`` often misses them.
+        We therefore also scan ``desktop.windows()`` as a fallback.
+        """
         timeout = timeout or self.settings.window_timeout
-        try:
-            return timings.wait_until(
-                timeout,
-                desktop.window,
-                title_re=f".*{title}.*",
-                backend=self.settings.uia_backend,
-            )
-        except Exception as exc:  # pywinauto raises various timeouts
-            raise FlowTimeoutError(f"window '{title}'", str(exc)) from exc
+        deadline = time.monotonic() + timeout
+        last_exc: Optional[Exception] = None
+        title_lower = title.lower()
+        while time.monotonic() < deadline:
+            # Fast path: desktop.window() spec match.
+            try:
+                win = desktop.window(title_re=f".*{title}.*")
+                if win.exists(timeout=0.3):
+                    return win
+            except Exception as exc:
+                last_exc = exc
+            # Slow path: enumerate all visible top-level windows (modal dialogs).
+            try:
+                for w in desktop.windows():
+                    try:
+                        wt = (w.window_text() or "").strip()
+                        if wt and title_lower in wt.lower():
+                            return w
+                    except Exception:
+                        continue
+            except Exception as exc:
+                last_exc = exc
+            time.sleep(0.3)
+        raise FlowTimeoutError(f"window '{title}'", str(last_exc or "window not found")) from last_exc
 
     def for_control(self, window_spec, control_type: Optional[str] = None,
                     auto_id: Optional[str] = None,
                     title: Optional[str] = None,
                     timeout: Optional[float] = None) -> Any:
         """Wait until a control with the given property signature exists."""
-        from pywinauto import timings
-
         timeout = timeout or self.settings.control_timeout
         kwargs: dict[str, Any] = {}
         if control_type:
@@ -142,10 +159,17 @@ class Waits:
             kwargs["auto_id"] = auto_id
         if title:
             kwargs["title"] = title
-        try:
-            return timings.wait_until(timeout, window_spec.child_window, **kwargs)
-        except Exception as exc:  # pragma: no cover - pywinauto timeout internals
-            raise FlowTimeoutError(f"control {kwargs}", str(exc)) from exc
+        deadline = time.monotonic() + timeout
+        last_exc: Optional[Exception] = None
+        while time.monotonic() < deadline:
+            try:
+                ctrl = window_spec.child_window(**kwargs)
+                if ctrl.exists(timeout=0.3):
+                    return ctrl
+            except Exception as exc:
+                last_exc = exc
+            time.sleep(0.3)
+        raise FlowTimeoutError(f"control {kwargs}", str(last_exc or "control not found")) from last_exc
 
     # -- stable list snapshots ------------------------------------------------
 
