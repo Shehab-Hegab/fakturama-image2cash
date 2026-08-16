@@ -49,3 +49,15 @@ htmlcov/
 # IDE
 .idea/
 .vscode/
+# Runtime/debug artifacts
+assets/screenshots/failure_*
+assets/screenshots/diag_*
+assets/screenshots/debug_*
+assets/screenshots/hdr_zoom.png
+assets/screenshots/items_table_zoom.png
+assets/screenshots/row1_zoom.png
+assets/screenshots/current_state.png
+assets/screenshots/after_*
+assets/screenshots/Screenshot*
+assets/screenshots/New folder*/
+

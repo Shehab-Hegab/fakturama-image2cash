@@ -350,7 +350,9 @@ def default_registry() -> dict[str, Role]:
             Strategy("name", "Payment", regex=True),
         ).add(Strategy("control_type", "ComboBox", require_unique=False)),
         "INVOICE_PAID_STATUS": Role("INVOICE_PAID_STATUS").add(
-            Strategy("name", "Paid", regex=True),
+            Strategy("control_type", "CheckBox", name_filter="paid"),
+        ).add(
+            Strategy("name", r"(?i)^paid$", regex=True),
         ).add(Strategy("name", r"(?i).*paid.*", regex=True)),
         "INVOICE_PAID_CHECKBOX": Role("INVOICE_PAID_CHECKBOX").add(
             Strategy("name", r"(?i)^paid$", regex=True),
@@ -409,6 +411,9 @@ def default_registry() -> dict[str, Role]:
         "DOCUMENTS_TABLE": Role("DOCUMENTS_TABLE").add(
             Strategy("control_type", "Table"),
         ).add(Strategy("class", "SWT.Table")),
+        "DOCUMENTS_TREE": Role("DOCUMENTS_TREE").add(
+            Strategy("control_type", "Tree"),
+        ).add(Strategy("class", "SWT.Tree")),
     }
 
 

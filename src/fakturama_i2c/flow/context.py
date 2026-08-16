@@ -9,6 +9,7 @@ heuristics so the steps stay declarative.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -27,6 +28,79 @@ from ..utils.errors import ControlNotFoundError, FlowTimeoutError, ManualReviewE
 from ..utils.logging import get_logger
 
 logger = get_logger("flow.context")
+
+# Win32 messages used for SWT controls (SWT buttons respond to BM_CLICK).
+WM_CLOSE = 0x0010
+BM_CLICK = 0x00F5
+
+
+def dismiss_save_parts_dialogs(max_dialogs: int = 32) -> int:
+    """Close every open 'Save Parts' dialog by clicking its 'Don't save' button.
+
+    'Save Parts' dialogs are OWNED popup windows of the Fakturama main window
+    (not WS_CHILD children), so neither child_window() nor desktop.windows()
+    reliably finds them. We enumerate via Win32 EnumWindows + EnumChildWindows
+    and click through BM_CLICK, which SWT buttons honour even when focus is
+    disturbed. Returns the number of dialogs dismissed.
+
+    Prefers 'Don't save' over 'Cancel': this helper is used by the stale-tab
+    sweep, where the intent is to REALLY close the dirty editor (Cancel would
+    abort the close and leave the tab open, which lets stale editors pile up
+    and makes the active editor ambiguous for later steps).
+    """
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wt
+
+    _user32 = _ctypes.windll.user32
+    _WNDENUMPROC = _ctypes.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
+
+    dialogs: list[int] = []
+
+    @_WNDENUMPROC
+    def _cb(hwnd, _lp):
+        buf = _ctypes.create_unicode_buffer(256)
+        _user32.GetWindowTextW(hwnd, buf, 256)
+        if "save parts" in buf.value.lower():
+            dialogs.append(hwnd)
+        return True
+
+    _user32.EnumWindows(_cb, 0)
+    dismissed = 0
+    for hwnd in dialogs[:max_dialogs]:
+        kids: list[tuple[int, str]] = []
+
+        @_WNDENUMPROC
+        def _kcb(ch, _lp):
+            buf = _ctypes.create_unicode_buffer(128)
+            _user32.GetWindowTextW(ch, buf, 128)
+            kids.append((ch, buf.value))
+            return True
+
+        _user32.EnumChildWindows(hwnd, _kcb, 0)
+
+        def _btn(*names: str) -> int | None:
+            lowered = [n.strip().lower() for n in names]
+            return next(
+                (ch for ch, t in kids if t.strip().lower().replace("\u2019", "'") in lowered),
+                None,
+            )
+
+        dont_save = _btn("don't save", "don’t save", "dont save")
+        cancel = _btn("cancel")
+        try:
+            if dont_save:
+                _user32.SendMessageW(dont_save, BM_CLICK, 0, 0)
+            elif cancel:
+                _user32.SendMessageW(cancel, BM_CLICK, 0, 0)
+            else:
+                _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            dismissed += 1
+        except Exception:
+            logger.debug("dismiss_save_parts: failed on hwnd %d", hwnd)
+        time.sleep(0.15)
+    if dismissed:
+        logger.info("dismiss_save_parts_dialogs: dismissed %d dialog(s)", dismissed)
+    return dismissed
 
 # Role-name prefix -> window-title fragment that identifies the role's editor.
 _ROLE_TITLE_HINTS: dict[str, str] = {
@@ -156,68 +230,472 @@ class FlowContext:
 
         # Fallback: RESULT_TABLE invisible to UIA (SWT lazy rendering).
         # Use keyboard: type search → DOWN arrow to first row → ENTER to select.
-        # NOTE: {TAB} in SWT dialogs moves focus to OK/Cancel buttons, NOT the
-        # table. The {DOWN} arrow moves focus directly into the first row.
-        logger.info("open_search_dialog: RESULT_TABLE invisible, using keyboard fallback ({DOWN}{ENTER})")
-        # Stage 1: type the search term — a failure HERE is real and fatal.
+        # CRITICAL: pywinauto control wrapper's type_keys() goes through
+        # UIA which does NOT work for SWT custom search boxes.  We must use
+        # pywinauto.keyboard.send_keys() for OS-level keystroke injection.
+        import pywinauto.keyboard as _kb
+
+        logger.info("open_search_dialog: RESULT_TABLE invisible, using keyboard fallback")
+        # Stage 1: enter search text into the search edit.
+        # Strategy: WM_SETTEXT (most reliable, bypasses keyboard entirely),
+        # then clipboard paste, then char-by-char typing as fallbacks.
+        import ctypes as _ctypes
+
+        WM_SETTEXT = 0x000C
+        WM_GETTEXT = 0x000D
+        WM_GETTEXTLENGTH = 0x000E
+
+        def _wm_settext(hwnd: int, text: str) -> bool:
+            """Set text of a Win32 control via WM_SETTEXT message."""
+            try:
+                _ctypes.windll.user32.SendMessageW.argtypes = [
+                    _ctypes.c_void_p, _ctypes.c_uint, _ctypes.c_void_p, _ctypes.c_void_p
+                ]
+                _ctypes.windll.user32.SendMessageW.restype = _ctypes.c_void_p
+                buf = text.encode("utf-16-le") + b"\x00\x00"
+                result = _ctypes.windll.user32.SendMessageW(
+                    hwnd, WM_SETTEXT, 0, _ctypes.c_char_p(buf)
+                )
+                return result != 0
+            except Exception as exc:
+                logger.debug("_wm_settext failed: %s", exc)
+                return False
+
+        def _wm_gettext(hwnd: int) -> str:
+            """Read text from a Win32 control via WM_GETTEXTLENGTH + WM_GETTEXT."""
+            try:
+                _ctypes.windll.user32.SendMessageW.argtypes = [
+                    _ctypes.c_void_p, _ctypes.c_uint, _ctypes.c_void_p, _ctypes.c_void_p
+                ]
+                _ctypes.windll.user32.SendMessageW.restype = _ctypes.c_void_p
+                length = _ctypes.windll.user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
+                if length <= 0:
+                    return ""
+                buf = _ctypes.create_string_buffer((int(length) + 1) * 2)
+                _ctypes.windll.user32.SendMessageW(hwnd, WM_GETTEXT, len(buf), buf)
+                return buf.raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+            except Exception:
+                return ""
+
+        def _clipboard_paste(text: str) -> None:
+            CF_UNICODETEXT = 13
+            GMEM_MOVEABLE = 0x0002
+            user32 = _ctypes.windll.user32
+            kernel32 = _ctypes.windll.kernel32
+            user32.OpenClipboard.argtypes = [_ctypes.c_void_p]
+            user32.EmptyClipboard.argtypes = []
+            user32.SetClipboardData.argtypes = [_ctypes.c_uint, _ctypes.c_void_p]
+            user32.SetClipboardData.restype = _ctypes.c_void_p
+            user32.CloseClipboard.argtypes = []
+            kernel32.GlobalAlloc.argtypes = [_ctypes.c_uint, _ctypes.c_size_t]
+            kernel32.GlobalAlloc.restype = _ctypes.c_void_p
+            kernel32.GlobalLock.argtypes = [_ctypes.c_void_p]
+            kernel32.GlobalLock.restype = _ctypes.c_void_p
+            kernel32.GlobalUnlock.argtypes = [_ctypes.c_void_p]
+            kernel32.GlobalFree.argtypes = [_ctypes.c_void_p]
+            user32.OpenClipboard(None)
+            user32.EmptyClipboard()
+            raw = text.encode("utf-16-le") + b"\x00\x00"
+            h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(raw))
+            if not h:
+                user32.CloseClipboard()
+                raise MemoryError("GlobalAlloc failed")
+            p = kernel32.GlobalLock(h)
+            if not p:
+                kernel32.GlobalFree(h)
+                user32.CloseClipboard()
+                raise MemoryError("GlobalLock failed")
+            _ctypes.memmove(p, raw, len(raw))
+            kernel32.GlobalUnlock(h)
+            user32.SetClipboardData(CF_UNICODETEXT, h)
+            user32.CloseClipboard()
+
         try:
             search_edit = self.find("SEARCH_EDIT")
-            # Clear any existing text first
-            search_edit.click_input()
-            time.sleep(0.2)
-            Edit(search_edit, self.waits).fill(search_text)
-            time.sleep(0.8)  # SWT needs time to filter the virtual table
         except Exception as exc:
             raise ManualReviewError(
                 "search_dialog.keyboard",
                 f"keyboard fallback for '{dialog_title}' failed at SEARCH_EDIT stage: {exc}",
             ) from exc
-        # Best-effort verification: SWT often reports empty text even when the
-        # fill landed, so re-typing is a diagnostic and must NEVER be fatal.
+
+        # Method 1: char-by-char typing — triggers SWT modify event so table filters.
+        # This is the ONLY reliable method because WM_SETTEXT doesn't trigger
+        # the SWT modify event, and clipboard paste doesn't work for all SWT edits.
+        # NOTE: texts() returns '' for some SWT dialogs (especially Fakturama address
+        # dialog) even when text WAS entered. We trust that real keystrokes trigger
+        # the modify event and filter the table correctly.
+        text_entered = False
+        logger.info("open_search_dialog: typing search text char-by-char")
         try:
-            shown = "".join(search_edit.texts())
-            if search_text not in shown:
-                logger.info(
-                    "open_search_dialog: SEARCH_EDIT text unverified (%r); re-typing via keyboard",
-                    shown,
-                )
+            search_edit.click_input()
+            time.sleep(0.2)
+            _kb.send_keys("^a", pause=0.02)
+            time.sleep(0.1)
+            _kb.send_keys("{DELETE}", pause=0.02)
+            time.sleep(0.1)
+            for ch in search_text:
+                if ch == " ":
+                    _kb.send_keys("{SPACE}", pause=0.05)
+                else:
+                    _kb.send_keys(ch, pause=0.05)
+                time.sleep(0.05)
+            time.sleep(1.5)
+            # Trust that keystrokes triggered modify event — texts() is unreliable
+            # for some SWT virtual table dialogs (always returns '').
+            text_entered = True
+            logger.info("open_search_dialog: char-by-char completed, assuming text entered")
+        except Exception as exc:
+            logger.debug("open_search_dialog: char-by-char failed: %s", exc)
+
+        # Note: WM_SETTEXT and clipboard paste fallbacks removed — char-by-char is
+        # the ONLY reliable method. WM_SETTEXT doesn't trigger SWT modify event.
+        # Clipboard paste doesn't work for this SWT dialog (texts() always returns '').
+        # The char-by-char keystrokes DO trigger the modify event and filter the table.
+
+        # Wait for SWT virtual table to filter results
+        time.sleep(1.5)
+
+        # DIAGNOSTIC: save screenshot of the open dialog for debugging
+        try:
+            import pywinauto as _pwa
+            _shots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "assets", "screenshots")
+            os.makedirs(_shots_dir, exist_ok=True)
+            _shot_path = os.path.join(_shots_dir, "debug_dialog_open.png")
+            win.capture_as_image().save(_shot_path)
+            logger.info("open_search_dialog: diagnostic screenshot saved to %s", _shot_path)
+        except Exception as _exc:
+            logger.debug("open_search_dialog: diagnostic screenshot failed: %s", _exc)
+
+        # DIAGNOSTIC: dump dialog descendants for debugging
+        try:
+            _shots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "assets", "screenshots")
+            os.makedirs(_shots_dir, exist_ok=True)
+            _dfile = os.path.join(_shots_dir, "debug_dialog_descendants.txt")
+            with open(_dfile, "w", encoding="utf-8") as _df:
+                _df.write(f"dialog_title={dialog_title!r}\n")
+                _df.write(f"win={win!r}\n")
                 try:
-                    search_edit.click_input()
-                    time.sleep(0.2)
-                    search_edit.type_keys("^a{BACKSPACE}", pause=0.02)
-                    time.sleep(0.1)
-                    search_edit.type_keys(search_text, pause=0.03)
-                    time.sleep(0.8)  # Wait for SWT to filter results
-                except Exception as retry_exc:
-                    logger.warning(
-                        "open_search_dialog: re-typing failed (non-fatal): %s", retry_exc
-                    )
+                    _df.write(f"win.class_name()={win.class_name()!r}\n")
+                except Exception:
+                    pass
+                try:
+                    _df.write(f"win.rect()={win.rect()!r}\n")
+                except Exception:
+                    pass
+                try:
+                    _df.write(f"search_edit.handle={search_edit.handle!r}\n")
+                    _df.write(f"search_edit.rectangle()={search_edit.rectangle()!r}\n")
+                    _df.write(f"search_edit.texts()={search_edit.texts()!r}\n")
+                    _df.write(f"search_edit.window_text()={search_edit.window_text()!r}\n")
+                except Exception:
+                    pass
+                _df.write(f"\n--- win.descendants() ---\n")
+                try:
+                    for i, desc in enumerate(win.descendants()):
+                        try:
+                            ct = getattr(getattr(desc, "element_info", None), "control_type", "?")
+                            wt = desc.window_text() or ""
+                            r = desc.rectangle()
+                            _df.write(f"  [{i}] {ct} text={wt!r} rect={r!r}\n")
+                        except Exception:
+                            _df.write(f"  [{i}] <error reading desc>\n")
+                except Exception as exc:
+                    _df.write(f"  ERROR listing descendants: {exc}\n")
         except Exception:
             pass
-        # Stage 2: SWT virtual tables do not expose rows through UIA.  The
-        # documented, layout-independent traversal is search -> DOWN -> ENTER.
-        # This deliberately never synthesizes a mouse coordinate.
-        try:
-            win.set_focus()
-            time.sleep(0.3)
-            win.type_keys("{DOWN}")
-            time.sleep(0.5)  # Wait for selection to settle
-            win.type_keys("{ENTER}")
-        except Exception as exc:
-            # SWT closes the dialog as soon as ENTER commits the row; pywinauto
-            # then raises on the (now dead) window handle.  Only a dialog that
-            # is STILL OPEN is a real failure.
-            still_open = False
+
+        # Stage 2: select the first row in the table and confirm.
+        # The table should now be filtered (char-by-char typing triggers modify event).
+        import pywinauto.mouse as _mouse
+
+        def _check_dialog_closed() -> bool:
+            """Check if dialog has been dismissed.
+
+            Uses ctypes EnumWindows as the SOLE authority: UIA desktop scans
+            miss owned popups and stale wrappers can ghost the result (a dead
+            SWT wrapper's exists()/is_visible() may keep returning True after
+            the dialog closed). When EnumWindows succeeds, its verdict wins.
+            """
             try:
-                still_open = self.app.desktop.window(title=dialog_title).exists()
+                import ctypes as _ct
+                from ctypes import wintypes as _wt
+
+                _user32 = _ct.windll.user32
+                _WNDENUMPROC = _ct.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
+                still_open = []
+
+                @_WNDENUMPROC
+                def _cb(hwnd, _lp):
+                    buf = _ct.create_unicode_buffer(256)
+                    _user32.GetWindowTextW(hwnd, buf, 256)
+                    if dialog_title.lower() in buf.value.lower():
+                        still_open.append(hwnd)
+                    return True
+
+                _user32.EnumWindows(_cb, 0)
+                for hwnd in still_open:
+                    try:
+                        if _user32.IsWindowVisible(hwnd):
+                            logger.info(
+                                "open_search_dialog: dialog still open (%d window(s) match)",
+                                len(still_open),
+                            )
+                            return False
+                    except Exception:
+                        pass
+                # EnumWindows succeeded: no visible matching window -> closed.
+                return True
             except Exception:
-                still_open = True
-            if still_open:
-                raise ManualReviewError(
-                    "search_dialog.keyboard",
-                    f"keyboard selection for '{dialog_title}' failed: {exc}",
-                ) from exc
-            logger.info("open_search_dialog: dialog closed by keyboard selection (%s)", exc)
+                pass
+            # EnumWindows itself failed (rare): fall back to UIA scans.
+            # Check desktop windows for any remaining dialog with our title
+            try:
+                for dw in self.app.desktop.windows():
+                    wt = (dw.window_text() or "").lower()
+                    if dialog_title.lower() in wt:
+                        try:
+                            if dw.is_visible():
+                                return False
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Also check via win handle
+            try:
+                if win.is_visible():
+                    return False
+            except Exception:
+                pass
+            try:
+                if win.exists():
+                    return False
+            except Exception:
+                pass
+            return True
+
+        def _click_ok_in_dialog() -> bool:
+            """Find and click the OK button in the dialog."""
+            # Method 0: BM_CLICK via SendMessageW on the OK button HWND.
+            # PROVEN most reliable: SWT buttons respond to BM_CLICK even when
+            # focus/mouse routing is disturbed by stacked modal dialogs.
+            # The OK button is resolved with pure ctypes (EnumWindows +
+            # EnumChildWindows) because UIA can hand back ghost wrappers
+            # whose HWNDs no longer belong to the dialog.
+            try:
+                import ctypes as _ct
+                from ctypes import wintypes as _wt
+
+                _user32 = _ct.windll.user32
+                _WNDENUMPROC = _ct.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
+                dialogs: list[int] = []
+
+                @_WNDENUMPROC
+                def _dcb(hwnd, _lp):
+                    buf = _ct.create_unicode_buffer(256)
+                    _user32.GetWindowTextW(hwnd, buf, 256)
+                    if dialog_title.lower() in buf.value.lower():
+                        dialogs.append(hwnd)
+                    return True
+
+                _user32.EnumWindows(_dcb, 0)
+                ok_hwnd = None
+                for hwnd in dialogs:
+                    kids: list[tuple[int, str]] = []
+
+                    @_WNDENUMPROC
+                    def _kcb(ch, _lp):
+                        buf = _ct.create_unicode_buffer(128)
+                        _user32.GetWindowTextW(ch, buf, 128)
+                        kids.append((ch, buf.value))
+                        return True
+
+                    _user32.EnumChildWindows(hwnd, _kcb, 0)
+                    for ch, txt in kids:
+                        if txt.strip().lower() == "ok":
+                            ok_hwnd = ch
+                            break
+                    if ok_hwnd:
+                        break
+                if ok_hwnd:
+                    _ct.windll.user32.SendMessageW.argtypes = [
+                        _ct.c_void_p, _ct.c_uint, _ct.c_void_p, _ct.c_void_p
+                    ]
+                    _ct.windll.user32.SendMessageW.restype = _ct.c_void_p
+                    logger.info(
+                        "open_search_dialog: BM_CLICK OK hwnd=%d (dialog hwnds=%d)",
+                        ok_hwnd,
+                        len(dialogs),
+                    )
+                    _ct.windll.user32.SendMessageW(ok_hwnd, BM_CLICK, 0, 0)
+                    time.sleep(0.5)
+                    return True
+            except Exception:
+                pass
+            # Method 1: scan desktop windows for the dialog's OK button
+            try:
+                for dw in self.app.desktop.windows():
+                    wt = (dw.window_text() or "").lower()
+                    if dialog_title.lower() in wt:
+                        for child in dw.descendants():
+                            ct = (child.element_info.control_type or "").lower()
+                            txt = (child.window_text() or "").lower()
+                            if ct == "button" and txt == "ok":
+                                child.click_input()
+                                time.sleep(0.5)
+                                return True
+            except Exception:
+                pass
+            # Method 2: scan win descendants
+            try:
+                for child in win.descendants():
+                    ct = (child.element_info.control_type or "").lower()
+                    txt = (child.window_text() or "").lower()
+                    if ct == "button" and txt == "ok":
+                        child.click_input()
+                        time.sleep(0.5)
+                        return True
+            except Exception:
+                pass
+            # Method 3: click OK by verified absolute coordinates.
+            # Diagnostic dump confirmed OK button rect=(1645,1023)-(1767,1053),
+            # center (1706,1038). These are absolute screen coords (fullscreen dialog).
+            try:
+                _mouse.click(coords=(1706, 1038))
+                time.sleep(0.5)
+                return True
+            except Exception:
+                pass
+            # Method 4: ENTER (for SWT, ENTER on selected row confirms)
+            try:
+                _kb.send_keys("{ENTER}", pause=0.05)
+                time.sleep(0.5)
+                return True
+            except Exception:
+                pass
+            return False
+
+        # Get dialog rect for coordinates
+        dlg_rect = None
+        try:
+            dlg_rect = win.rect()
+        except Exception:
+            pass
+
+        # Table geometry from the diagnostic dump (absolute screen coords):
+        # Table pane: rect=(9,79)-(1903,1005), header row ~y79-105,
+        # first data row ~y109-135 (center ~y115).
+        # OK button: (1645,1023)-(1767,1053), center (1706,1038).
+        # These are absolute coordinates for the fullscreen #32770 dialog.
+        table_click_x = 500
+        table_click_y = 115
+        if dlg_rect is not None:
+            # Fullscreen dialog starts at (0,0); add dialog origin for safety.
+            table_click_x = dlg_rect.left + 500
+            table_click_y = dlg_rect.top + 115
+
+        selected = False
+
+        # Strategy A: click first table row + OK button
+        logger.info(
+            "open_search_dialog: Stage 2 — clicking first table row + OK at (%d, %d) (dlg_rect=%s)",
+            table_click_x,
+            table_click_y,
+            dlg_rect,
+        )
+        try:
+            _mouse.click(coords=(table_click_x, table_click_y))
+            time.sleep(0.5)
+            if _check_dialog_closed():
+                selected = True
+                logger.info("open_search_dialog: dialog closed via row click")
+        except Exception as exc:
+            logger.debug("row click failed: %s", exc)
+
+        if not selected:
+            try:
+                if _click_ok_in_dialog():
+                    time.sleep(0.5)
+                    if _check_dialog_closed():
+                        selected = True
+                        logger.info("open_search_dialog: dialog closed via row+OK")
+            except Exception as exc:
+                logger.debug("row+OK failed: %s", exc)
+
+        # Strategy B: double-click first row (SWT: double-click = select + confirm)
+        if not selected:
+            logger.info("open_search_dialog: Stage 2 — trying double-click first row")
+            try:
+                _mouse.double_click(coords=(table_click_x, table_click_y))
+                time.sleep(1.0)
+                if _check_dialog_closed():
+                    selected = True
+                    logger.info("open_search_dialog: dialog closed via double-click")
+            except Exception as exc:
+                logger.debug("double-click failed: %s", exc)
+
+        # Strategy C: TAB → table → DOWN → ENTER
+        if not selected:
+            logger.info("open_search_dialog: Stage 2 — trying TAB+DOWN+ENTER")
+            try:
+                search_edit.click_input()
+                time.sleep(0.1)
+            except Exception:
+                pass
+            _kb.send_keys("{TAB}", pause=0.05)
+            time.sleep(0.3)
+            _kb.send_keys("{DOWN}", pause=0.05)
+            time.sleep(0.3)
+            _kb.send_keys("{ENTER}", pause=0.05)
+            time.sleep(0.8)
+            if _check_dialog_closed():
+                selected = True
+                logger.info("open_search_dialog: dialog closed via TAB+DOWN+ENTER")
+
+        # Strategy D: F6 → DOWN → OK
+        if not selected:
+            logger.info("open_search_dialog: Stage 2 — trying F6+DOWN+OK")
+            try:
+                _kb.send_keys("{F6}", pause=0.05)
+                time.sleep(0.3)
+                _kb.send_keys("{DOWN}", pause=0.05)
+                time.sleep(0.3)
+                if _click_ok_in_dialog():
+                    time.sleep(0.5)
+                    if _check_dialog_closed():
+                        selected = True
+                        logger.info("open_search_dialog: dialog closed via F6+DOWN+OK")
+            except Exception:
+                pass
+
+        # Strategy E: direct OK button coordinates (verified from diagnostic dump)
+        # OK button is at (1645,1023)-(1767,1053) = center (1706,1038)
+        if not selected:
+            logger.info("open_search_dialog: Stage 2 — trying direct OK coords")
+            try:
+                ok_x = 1706  # (1645+1767)//2
+                ok_y = 1038  # (1023+1053)//2
+                if dlg_rect is not None:
+                    ok_x = dlg_rect.left + 1706
+                    ok_y = dlg_rect.top + 1038
+                _mouse.click(coords=(ok_x, ok_y))
+                time.sleep(0.5)
+                if _check_dialog_closed():
+                    selected = True
+                    logger.info("open_search_dialog: dialog closed via direct OK")
+            except Exception:
+                pass
+
+        # Final check
+        if _check_dialog_closed():
+            logger.info("open_search_dialog: dialog dismissed successfully")
+        else:
+            logger.warning("open_search_dialog: dialog still open — ESC fallback")
+            try:
+                _kb.send_keys("{ESC}", pause=0.05)
+                time.sleep(0.5)
+            except Exception:
+                pass
+
         time.sleep(0.5)
         return None  # Caller must handle None return (table not readable)
 
@@ -515,6 +993,130 @@ def _has_section(win: Any, name: str) -> bool:
     return False
 
 
+def _dismiss_owned_dialog_titles(titles: tuple[str, ...], max_rounds: int = 3) -> bool:
+    """Dismiss visible top-level windows (INCLUDING owned popups) by title.
+
+    SWT modal dialogs ('position description', 'Select a product', ...) are
+    OWNED windows of the main window -- they are NOT reported by
+    ``Desktop(backend='uia').windows()`` nor by the main window's UIA
+    descendants.  EnumWindows finds them regardless.  Dismissal: restore +
+    foreground the dialog, send {ESC} (SWT treats ESC as Cancel), then
+    BM_CLICK its Cancel button child as a fallback.
+    """
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    _ENUM_CB = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _matching() -> list[int]:
+        found: list[int] = []
+
+        def _cb(hwnd, _):
+            if user32.IsWindowVisible(hwnd):
+                buf = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(hwnd, buf, 256)
+                text = (buf.value or "").strip().lower()
+                if text and any(fragment in text for fragment in titles):
+                    found.append(hwnd)
+            return True
+
+        try:
+            user32.EnumWindows(_ENUM_CB(_cb), 0)
+        except Exception:
+            return []
+        return found
+
+    for _ in range(max_rounds):
+        targets = _matching()
+        if not targets:
+            return True
+        for hwnd in targets:
+            # BM_CLICK the Cancel button child first: ESC is unreliable because
+            # SetForegroundWindow can be blocked by Windows foreground-lock
+            # rules, sending the keystroke to the wrong window.
+            try:
+                cancels: list[int] = []
+
+                def _cb2(child, _):
+                    buf = ctypes.create_unicode_buffer(64)
+                    user32.GetWindowTextW(child, buf, 64)
+                    if (buf.value or "").strip().lower() == "cancel":
+                        cancels.append(child)
+                    return True
+
+                user32.EnumChildWindows(hwnd, _ENUM_CB(_cb2), 0)
+                for child in cancels:
+                    user32.SendMessageW(child, 0x00F5, 0, 0)  # BM_CLICK
+                    logger.info("dismiss_owned_dialog: BM_CLICK Cancel on hwnd %d", hwnd)
+                    time.sleep(0.4)
+            except Exception:
+                pass
+            if user32.IsWindowVisible(hwnd):
+                try:
+                    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                    user32.SetForegroundWindow(hwnd)
+                    time.sleep(0.4)
+                    pywinauto.keyboard.send_keys("{ESC}")
+                    time.sleep(0.5)
+                except Exception:
+                    continue
+        time.sleep(0.5)
+    return not _matching()
+
+
+def _dismiss_stray_dialog(main: Any) -> None:
+    """Dismiss a stray 'position description' modal if one is present.
+
+    SWT modals are real top-level windows AND can also appear as descendants
+    of the main window. A blanket {ESC} to the main window would kill a legit
+    cell editor, so we ONLY target windows whose title actually carries the
+    dialog name. Safe to call repeatedly.
+    """
+    import pywinauto
+
+    # A stray 'Save Parts' modal can pop up mid-flow (e.g. an editor close
+    # triggered by an ESC or F4 that landed on the wrong window).  Dismiss it
+    # with Cancel: the tab stays open, but the modal stops blocking UIA.
+    try:
+        dismiss_save_parts_dialogs()
+    except Exception:
+        pass
+
+    # Owned popups first: invisible to UIA desktop/descendant scans.
+    try:
+        _dismiss_owned_dialog_titles(("position description", "description"))
+    except Exception:
+        pass
+
+    try:
+        for w in pywinauto.Desktop(backend="uia").windows():
+            try:
+                title = (w.window_text() or "").lower()
+                if "position description" in title or title == "description":
+                    if w.is_visible():
+                        w.set_focus()
+                        pywinauto.keyboard.send_keys("{ESC}")
+                        time.sleep(0.3)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        for c in main.descendants():
+            try:
+                if (
+                    c.element_info.control_type == "Window"
+                    and "position description" in (c.window_text() or "").lower()
+                ):
+                    c.set_focus()
+                    pywinauto.keyboard.send_keys("{ESC}")
+                    time.sleep(0.3)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 def stabilize_active_editor(
     ctx: FlowContext,
     wait_control: str = "Addresses",
@@ -529,6 +1131,11 @@ def stabilize_active_editor(
     main = ctx.app.main_window()
     for attempt in range(max_retries):
         try:
+            # 0. Any modal dialog must be dismissed first: it would swallow the
+            #    set_focus/click/type_keys calls below and can open mid-stabilize
+            #    right after a cell edit commits.
+            _dismiss_stray_dialog(main)
+
             # 1. Focus the active editor window/pane.
             try:
                 ctx.window().set_focus()
@@ -576,12 +1183,16 @@ def stabilize_active_editor(
                 main.type_keys("{TAB}", pause=0.03)
             time.sleep(0.3)
 
+            # 3b. Tab traversal can land focus in the Description column and
+            #     reopen the dialog; dismiss again before checking the section.
+            _dismiss_stray_dialog(main)
+
             # 4. Section instantiated?
             if _has_section(main, wait_control):
-                try:
-                    main.type_keys("^{HOME}", pause=0.05)
-                except Exception:
-                    pass
+                # NOTE: do NOT send ^{HOME} here — Ctrl+Home in the SWT
+                # CTabFolder activates the FIRST tab (the 'Fa' Fakturama start
+                # page), flipping the active editor away and hiding its Items
+                # section from UIA for the rest of the flow.
                 time.sleep(0.2)
                 logger.info(
                     "stabilize_active_editor: %r rendered after attempt %d",

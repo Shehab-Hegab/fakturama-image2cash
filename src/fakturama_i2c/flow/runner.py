@@ -83,6 +83,7 @@ def run_flow(settings: Settings, image_path, launch: bool = False) -> Extraction
 
     try:
         ctx.app.connect(launch=launch)
+        _dismiss_stray_dialogs(ctx)
         for name, step in _FLOW_STEPS:
             logger.info("---- %s ----", name)
             step(ctx)
@@ -127,3 +128,49 @@ def _final_screenshot(ctx: FlowContext) -> None:
         capture_window(ctx.window(), ctx.settings.screenshot_dir, "flow_complete")
     except Exception as exc:
         logger.warning("final screenshot failed: %s", exc)
+
+
+import time
+
+def _dismiss_stray_dialogs(ctx: FlowContext) -> None:
+    """Pre-flight: dismiss any leftover modal dialogs from previous runs.
+
+    Eclipse SWT modal dialogs (e.g. 'position description', 'Select the
+    address') are child windows of the Fakturama main window and can
+    survive across automation runs if the previous run crashed.
+    """
+    import pywinauto
+    try:
+        from .context import _dismiss_owned_dialog_titles
+
+        _dismiss_owned_dialog_titles(("position description", "select the address", "select a product", "save parts"))
+    except Exception:
+        pass
+    try:
+        main = ctx.app.main_window()
+        # Strategy 1: search desktop windows for any stray dialog
+        desktop = pywinauto.Desktop(backend="uia")
+        for win in desktop.windows():
+            try:
+                title = (win.window_text() or "").strip().lower()
+                if any(kw in title for kw in ("position description", "select the address", "select a product")):
+                    if win != main:
+                        try:
+                            win.set_focus()
+                        except Exception:
+                            pass
+                        pywinauto.keyboard.send_keys("{ESC}")
+                        time.sleep(0.5)
+                        logger.info("runner: dismissed stray dialog %r", win.window_text())
+            except Exception:
+                continue
+        # Strategy 2: send {ESC} to main window multiple times to clear any modals
+        try:
+            main.set_focus()
+        except Exception:
+            pass
+        for _ in range(3):
+            pywinauto.keyboard.send_keys("{ESC}")
+            time.sleep(0.3)
+    except Exception as exc:
+        logger.debug("runner: stray-dialog cleanup skipped: %s", exc)

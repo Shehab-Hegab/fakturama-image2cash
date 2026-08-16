@@ -17,6 +17,7 @@ from ..utils.errors import ControlNotFoundError, FlowTimeoutError, ManualReviewE
 from ..utils.logging import get_logger
 from .context import (
     FlowContext,
+    _dismiss_owned_dialog_titles,
     decimal_eq,
     row_has_exact,
     select_combo_value,
@@ -79,6 +80,8 @@ def _click_product_selector(ctx: FlowContext) -> None:
     last_exc: Exception | None = None
     for attempt in range(4):
         try:
+            # Dismiss any stray dialog before trying
+            _dismiss_position_description(ctx.window())
             Button(ctx.find("PRODUCT_SELECTOR"), ctx.waits).click()
             return
         except (ControlNotFoundError, ManualReviewError) as exc:
@@ -99,6 +102,13 @@ def _select_existing_product(ctx: FlowContext, order_win, item: ItemLine) -> boo
     ctx.set_window(order_win)
     # CRITICAL: SWT lazy rendering — the Items section (and its product
     # selector) is not in the UIA tree until the editor is stabilized.
+    # Also dismiss any stray "position description" dialog first.  The dialog
+    # can open with a DELAY after the previous cell edit commits, so sweep
+    # for it repeatedly over ~3s before stabilizing.
+    _activate_order_editor(ctx)
+    for _ in range(6):
+        _dismiss_position_description(ctx.window())
+        time.sleep(0.5)
     stabilize_active_editor(ctx, wait_control="Items", max_retries=5)
     _force_render_items(ctx)
     _click_product_selector(ctx)
@@ -314,17 +324,216 @@ def _create_product(ctx: FlowContext, order_win, item: ItemLine) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _find_position_description(main):
+    """Return the 'position description' dialog Window descendant if present,
+    else None.  The dialog is a [Window] 'position description' child of the
+    main Fakturama window (not a top-level desktop window)."""
+    try:
+        for ctrl in main.descendants():
+            try:
+                title = (ctrl.window_text() or "").strip().lower()
+                if "position description" in title and ctrl.element_info.control_type == "Window":
+                    return ctrl
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _dismiss_position_description(main) -> bool:
+    """Dismiss the 'position description' modal dialog if it appeared.
+
+    This yellow dialog opens when a double-click lands on the Description/Name
+    column instead of the intended cell.  It blocks all interaction until
+    dismissed.  Returns True if a dialog was found and dismissed.
+
+    Strategy (ordered from most to least reliable):
+    1. Search ALL desktop windows (Eclipse SWT modal dialogs are real top-level).
+    2. Search main window descendants for any dialog with "description" in title.
+
+    IMPORTANT: this function NEVER sends an unconditional {ESC} to the main
+    window.  A blanket {ESC} kills an open cell editor (cancels the in-place
+    edit) which is worse than the dialog itself.
+    """
+    import pywinauto as _pw
+    dismissed = False
+    # 0. Owned popups: invisible to UIA desktop/descendant scans.
+    try:
+        if _dismiss_owned_dialog_titles(("position description", "description")):
+            dismissed = True
+            logger.info("step3: dismissed 'position description' dialog (owned popup)")
+    except Exception:
+        pass
+    # 1. Desktop windows
+    try:
+        desktop = _pw.Desktop(backend="uia")
+        for win in desktop.windows():
+            try:
+                title = (win.window_text() or "").strip().lower()
+                if "position description" in title or "description" in title:
+                    # Only dismiss if it looks like a dialog (not the main window)
+                    if win != main:
+                        try:
+                            win.set_focus()
+                        except Exception:
+                            pass
+                        _pw.keyboard.send_keys("{ESC}")
+                        time.sleep(0.4)
+                        logger.info("step3: dismissed 'position description' dialog (desktop)")
+                        dismissed = True
+                        # Verify it's gone
+                        time.sleep(0.2)
+                        try:
+                            for w2 in desktop.windows():
+                                t2 = (w2.window_text() or "").strip().lower()
+                                if "position description" in t2 and w2 != main:
+                                    _pw.keyboard.send_keys("{ESC}")
+                                    time.sleep(0.3)
+                        except Exception:
+                            pass
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # 2. Main window descendants — the dialog is a [Window] 'position description'
+    #    descendant of main with an Edit + OK/Cancel buttons.  ctrl.close() does
+    #    NOT work on SWT modal windows; send {ESC} to that window, then click
+    #    Cancel as a fallback.
+    try:
+        for ctrl in main.descendants():
+            try:
+                title = (ctrl.window_text() or "").strip().lower()
+                if "position description" in title and ctrl.element_info.control_type == "Window":
+                    try:
+                        ctrl.set_focus()
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                    _pw.keyboard.send_keys("{ESC}")
+                    time.sleep(0.4)
+                    # Verify: if still present, click Cancel button
+                    try:
+                        cancel = ctrl.child_window(title="Cancel", control_type="Button")
+                        if cancel.exists(timeout=0.3):
+                            cancel.click()
+                            time.sleep(0.4)
+                    except Exception:
+                        pass
+                    logger.info("step3: dismissed 'position description' dialog (descendant Window)")
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return dismissed
+
+
+def _click_neutral_no_label(main, row_y: int = 0) -> None:
+    """Click a neutral spot in the 'No.' column to exit in-place editing.
+
+    After {ENTER} commits a cell edit, SWT focus moves to the next column
+    (Description/Name).  Any further keyboard input in that column can
+    trigger the 'position description' dialog.  Clicking a neutral spot
+    in the 'No.' column (the row-number column) cleanly exits in-place
+    editing without side effects.
+
+    If row_y is provided (>0), clicks at (360, row_y) to stay at the same
+    row level -- this preserves row context for subsequent cell edits
+    (e.g. discount after qty).  If row_y is 0, clicks the 'No.' column
+    header label at y≈180.
+    """
+    if row_y > 0:
+        # Click at the same row level in the 'No.' column (x≈360) to
+        # preserve row focus between cell edits on the same row.
+        try:
+            pywinauto.mouse.click(coords=(360, row_y))
+            time.sleep(0.15)
+            logger.debug("step3: clicked 'No.' column at row_y=%d to neutralize focus", row_y)
+            return
+        except Exception:
+            pass
+    try:
+        no_label = main.child_window(title_re=r"(?i)^No\.$", control_type="Text")
+        if no_label.exists(timeout=1.0):
+            no_label.click_input()
+            time.sleep(0.15)
+            logger.debug("step3: clicked 'No.' label to neutralize focus")
+            return
+    except Exception:
+        pass
+    # Fallback: click a point above the Items section header (column header area)
+    try:
+        pywinauto.mouse.click(coords=(360, 180))
+        time.sleep(0.15)
+    except Exception:
+        pass
+
+
+def _activate_order_editor(ctx: FlowContext) -> None:
+    """Activate the CURRENT run's '*New Order' editor tab.
+
+    SWT CTabFolder renders only the ACTIVE editor's content into the UIA
+    tree.  A leftover editor (e.g. the Customer editor opened while resolving
+    the debtor in step2, or stale '*New Order' tabs whose closes were aborted
+    by 'Save Parts' Cancel) can remain the active tab, which hides the real
+    Order's Items section from ORDER_ITEMS_TABLE and the 'Items' anchor.
+
+    Newest-first heuristic: editors are appended to the end of the CTabFolder
+    tab strip, so the LAST 'New Order' tab is the one opened by step1 of the
+    current run (older stale editors sit further left).  With the stale-tab
+    sweep really closing tabs (Don't save), there is normally only ONE
+    candidate anyway.  Each candidate is activated and verified via the
+    'Items' Text anchor before acceptance.
+    """
+    import pywinauto
+
+    main = ctx.app.main_window()
+    try:
+        tabs = main.descendants(control_type="TabItem")
+    except Exception as exc:
+        raise ControlNotFoundError("order_tab", f"cannot enumerate editor tabs: {exc}") from exc
+    candidates = [
+        t for t in tabs if "new order" in (t.window_text() or "").lower()
+    ]
+    if not candidates:
+        raise ControlNotFoundError("order_tab", "no '*New Order' editor tab found")
+
+    def _items_visible() -> bool:
+        try:
+            return any(
+                c.element_info.control_type == "Text" and "Items" in (c.window_text() or "")
+                for c in main.descendants()
+            )
+        except Exception:
+            return False
+
+    for tab in reversed(candidates):
+        rect = tab.rectangle()
+        pywinauto.mouse.click(
+            coords=(int((rect.left + rect.right) / 2), int((rect.top + rect.bottom) / 2))
+        )
+        time.sleep(1.0)
+        if _items_visible():
+            return
+    raise ControlNotFoundError("order_tab", "clicked 'New Order' tab(s) but 'Items' anchor stayed hidden")
+
+
 def _set_line_values_keyboard_fallback(ctx: FlowContext, item: ItemLine, row_index: int) -> None:
     """Anchor-relative keyboard fallback for Qty and Discount on the Items table.
 
     Used when ORDER_ITEMS_TABLE is invisible to UIA (SWT lazy rendering).
     Cell positions are offsets from the 'Items' section label bounding box --
-    never absolute screen coordinates.  U.Price is left untouched because
-    Fakturama fills it from the Product master data.
+    never absolute screen coordinates.  U.Price is explicitly re-set to the
+    extracted unit price because Fakturama fills it from the Product master
+    data, which can drift from the image (e.g. SKU-1002 master 10.00 vs
+    extracted 9.90).
     """
     import pywinauto
 
     main = ctx.window()
+    _activate_order_editor(ctx)
     try:
         items_label = next(
             c for c in main.descendants()
@@ -336,20 +545,34 @@ def _set_line_values_keyboard_fallback(ctx: FlowContext, item: ItemLine, row_ind
             "items_anchor", "cannot find 'Items' anchor for keyboard fallback"
         ) from exc
 
-    # Anchor-relative cell offsets (calibrated against live UIA probe):
-    # Qty column centre is +138px from the Items label's left edge.
-    # Discount column centre is +1015px (probed live: U.Price cell ends at
-    # X≈1300, Discount cell starts at X≈1340, centre ≈1405; anchor.left=390
-    # → 390+1015=1405).  Previous offset +908 landed inside the U.Price
-    # cell and corrupted unit prices — never again.
-    qty_x = anchor_rect.left + 138
-    discount_x = anchor_rect.left + 1015
-    row_y = anchor_rect.top + 27 + (row_index * 30)
+    # Anchor-relative cell offsets (calibrated live by double-click probing
+    # the Items table row 1 of the current order editor):
+    #   Qty cell editor opens for x∈[444..650] → centre ≈ 500
+    #   VAT is a combo editor at x∈[1059..1170] — never aim there
+    #   U.Price editor rect x∈[1184..1308] → centre ≈ 1246
+    #   Discount editor rect x∈[1309..1433] → centre ≈ 1371
+    #   Price column (right of Discount) has NO editor — it is derived
+    #   x=1000 opens the 'position description' dialog (Description column) —
+    #   never aim there.
+    # anchor.left=338 → qty offset +162, price offset +908, discount offset
+    # +1033.  Row 0 data band centre y≈412; anchor.top=374 → row offset +38.
+    qty_x = anchor_rect.left + 162
+    price_x = anchor_rect.left + 908
+    discount_x = anchor_rect.left + 1033
+    row_y = anchor_rect.top + 38 + (row_index * 30)
 
     def _open_cell_editor(cx, cy):
         """Double-click + probe + F2 fallback to open a SWT cell editor."""
+        # CRITICAL: dismiss any stray dialog BEFORE the double-click — an open
+        # 'position description' (or 'Save Parts') modal would swallow the
+        # click and no cell editor would open.
+        _dismiss_position_description(main)
         pywinauto.mouse.double_click(coords=(cx, cy))
         time.sleep(0.5)
+        # CRITICAL: double-click on the wrong column (Description/Name) triggers
+        # a "position description" modal dialog that blocks all interaction.
+        # Dismiss it IMMEDIATELY before checking for the cell editor.
+        _dismiss_position_description(main)
         found = False
         try:
             for ctrl in main.descendants():
@@ -363,6 +586,8 @@ def _set_line_values_keyboard_fallback(ctx: FlowContext, item: ItemLine, row_ind
         if not found:
             pywinauto.keyboard.send_keys("{F2}")
             time.sleep(0.4)
+            # F2 might also trigger the description dialog
+            _dismiss_position_description(main)
 
     def _type_in_cell(cx, cy, value):
         """Open cell editor, select-all, type value, commit.
@@ -370,39 +595,88 @@ def _set_line_values_keyboard_fallback(ctx: FlowContext, item: ItemLine, row_ind
         CRITICAL: ^a (Ctrl+A) does NOT work in SWT cell editors — it selects
         ALL ROWS in the table instead of all text in the cell.  Use Home then
         Shift+End to select all text, then type the replacement value.
-        Double-click already positions cursor; if text isn't selected, the
-        Home+Shift+End combo ensures full selection.
+
+        {ENTER} commits the edit.  If focus then moves to the Description
+        column, a 'position description' dialog may open; dismiss it with the
+        robust helper after committing.
+
+        Only keystrokes are sent once the cell editor is confirmed open: a
+        failed double-click would leave focus in the Description column and
+        typing there triggers the 'position description' dialog.
         """
-        _open_cell_editor(cx, cy)
-        # Select all text in the cell editor via Home + Shift+End (not ^a!)
-        pywinauto.keyboard.send_keys("{HOME}")
-        time.sleep(0.1)
-        pywinauto.keyboard.send_keys("+{END}")
-        time.sleep(0.1)
-        pywinauto.keyboard.send_keys(str(value))
-        time.sleep(0.2)
-        pywinauto.keyboard.send_keys("{ENTER}")
-        time.sleep(0.4)
-        pywinauto.keyboard.send_keys("{ESC}")
-        time.sleep(0.3)
+        for attempt in range(3):
+            _dismiss_position_description(main)
+            _open_cell_editor(cx, cy)
+            if not _cell_editor_open(cx, cy):
+                logger.warning(
+                    "step3: cell editor for %r at (%d,%d) did not open (attempt %d); retrying...",
+                    value, cx, cy, attempt + 1,
+                )
+                continue
+            pywinauto.keyboard.send_keys("{HOME}")
+            time.sleep(0.1)
+            pywinauto.keyboard.send_keys("+{END}")
+            time.sleep(0.1)
+            pywinauto.keyboard.send_keys(str(value))
+            time.sleep(0.2)
+            pywinauto.keyboard.send_keys("{ENTER}")
+            time.sleep(0.4)
+            # CRITICAL: After {ENTER} commits the cell, SWT focus advances
+            # to the next column (Description).  A bare {ESC} or any further
+            # typing in that column triggers the 'position description'
+            # dialog.  Instead, click the neutral 'No.' column-header label
+            # to cleanly exit in-place editing mode.
+            _click_neutral_no_label(main, row_y=cy)
+            time.sleep(0.3)
+            _dismiss_position_description(main)
+            # Verify the edit cell is gone (committed) and no dialog remains.
+            dlg = _find_position_description(main)
+            if dlg is None:
+                return
+            logger.info(
+                "step3: 'position description' dialog reappeared (attempt %d); retrying...",
+                attempt + 1,
+            )
+            _dismiss_position_description(main)
+            time.sleep(0.5)
+        logger.warning("step3: cell edit for %r possibly blocked by dialog", value)
+
+    def _cell_editor_open(cx, cy):
+        """True when an Edit control sits near (cx, cy) — the SWT cell editor."""
+        try:
+            for ctrl in main.descendants():
+                if ctrl.element_info.control_type == "Edit":
+                    r = ctrl.rectangle()
+                    if (cx - 80) < r.left < (cx + 80) and abs(r.top - cy) < 40:
+                        return True
+        except Exception:
+            pass
+        return False
 
     # --- Qty cell: double-click to open editor (single-click doesn't activate
     #     SWT inline editor; ^a then selects all ROWS instead of cell text) ---
     _type_in_cell(qty_x, row_y, item.quantity)
+
+    # --- U.Price cell: enforce the extracted unit price on the line (the
+    #     master-derived value can drift, e.g. SKU-1002 shows 10.00 while the
+    #     image says 9.90; step4 reconciles totals against the extraction). ---
+    _type_in_cell(price_x, row_y, format_decimal(item.unit_net_price))
 
     # --- Discount cell (same row; only when the line has a discount) ---
     discount_pct = float(getattr(item, "discount_percent", 0) or 0)
     if discount_pct > 0:
         _type_in_cell(discount_x, row_y, format_decimal(item.discount_percent))
 
-    # --- Dismiss any stray 'position description' dialog opened by double-click ---
-    try:
-        dlg = main.child_window(title="position description", control_type="Window")
-        if dlg.exists(timeout=0.5):
-            pywinauto.keyboard.send_keys("{ESC}")
-            time.sleep(0.3)
-    except Exception:
-        pass
+    # --- Final cleanup: release SWT edit mode fully so the Product Selector
+    #     for SKU-1002 is not invoked while a cell editor is still active. ---
+    # The cell was already committed by _type_in_cell.  Click the neutral
+    # 'No.' column area at row level to cleanly exit in-place editing.  Do NOT
+    # send a bare {ESC} (it can cancel an edit or reopen the dialog) and
+    # do NOT click the 'Items' label (ExpandableComposite toggle collapses
+    # the section and hides the Product Selector button).
+    _click_neutral_no_label(main, row_y=row_y)
+    time.sleep(0.3)
+    _dismiss_position_description(main)
 
     logger.info(
         "step3: anchor-relative fallback set qty=%s, discount=%s%% for %r (row %d)",
@@ -416,6 +690,10 @@ def _set_line_values(ctx: FlowContext, item: ItemLine, row_index: int = 0) -> No
     When ORDER_ITEMS_TABLE is invisible to UIA (SWT lazy rendering), falls
     back to clicking into the items table area and using keyboard navigation.
     """
+    # SWT CTabFolder exposes only the ACTIVE editor's content to UIA.  A
+    # leftover editor (e.g. the Customer editor opened while resolving the
+    # debtor) can remain the active tab, hiding this Order's Items section.
+    _activate_order_editor(ctx)
     # Allow the items table to stabilize after product selection.
     # SWT lazy rendering may need multiple stabilization passes.
     for attempt in range(3):
@@ -516,6 +794,7 @@ def _force_render_items(ctx: FlowContext) -> None:
     making the Items section (and its product-selector Image icons)
     available in the UIA tree for PRODUCT_SELECTOR resolution.
     """
+    _activate_order_editor(ctx)
     try:
         ctx.window().set_focus()
     except Exception:

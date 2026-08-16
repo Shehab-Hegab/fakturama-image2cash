@@ -118,15 +118,19 @@ def _full_run(settings: Settings, image: Path, verify: bool, launch: bool) -> in
 
     app = _connect(settings, launch)
     verifier = Verifier(settings, app)
-    doc_report = verifier.verify_documents(
-        expected_reference=order.header.external_reference,
-        expected_total=str(order.totals.total_gross),
-    )
+    # Check the Invoice editor first: right after the flow it is the active
+    # tab of the main window (editors are tabs, not separate windows), so its
+    # fields are UIA-exposed.  verify_documents switches to the Documents
+    # view, which hides the editor from UIA again.
     pay_report = verifier.verify_invoice_payment(
         expected_method=order.payment.payment_method,
         expected_paid_status=order.payment.paid_status,
         expected_payment_date=order.payment.payment_date,
         expected_value=str(order.totals.total_gross),
+    )
+    doc_report = verifier.verify_documents(
+        expected_reference=order.header.external_reference,
+        expected_total=str(order.totals.total_gross),
     )
 
     print("Verification:")
@@ -135,6 +139,8 @@ def _full_run(settings: Settings, image: Path, verify: bool, launch: bool) -> in
         print(f"  [{status}] {label}")
         for name in rep.checks:
             print(f"      {name}: {rep.details.get(name, '')}")
+        for name in rep.skipped:
+            print(f"      {name}: SKIPPED — {rep.details.get(name, '')}")
 
     if not (doc_report.passed and pay_report.passed):
         print("error: verification failed")

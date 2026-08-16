@@ -54,6 +54,161 @@ def step_resolve_debtor(ctx: FlowContext) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _verify_address_after_select(ctx: FlowContext, debtor: DebtorData, label: str) -> None:
+    """Read the Invoice address area and verify the address matches.
+
+    Retries up to 8 seconds because SWT may need time to populate the
+    address form after keyboard selection.
+
+    IMPORTANT: The SWT Tab control does NOT expose children via UIA, so
+    we scan main.descendants() for text elements within the Tab's bounding
+    rect instead of reading Tab.children().
+    """
+    deadline = time.monotonic() + 8.0
+    addr_text = ""
+    attempt = 0
+
+    # Get the Invoice address Tab rect for positional scanning
+    tab_rect = None
+    try:
+        invoice_tab = ctx.find("ADDRESS_ROLE_INVOICE")
+        tab_rect = invoice_tab.rectangle()
+    except Exception:
+        pass
+
+    while time.monotonic() < deadline:
+        attempt += 1
+        time.sleep(0.8)
+
+        # Method 0: read Edit VALUES inside the Tab rect via WM_GETTEXT.
+        # SWT Edits do NOT expose their text through UIA window_text(), so
+        # UIA scans report an empty address even when it IS populated. The
+        # Win32 WM_GETTEXT path reads the real buffer of every Edit whose
+        # rect lies inside the Invoice address Tab.
+        try:
+            main = ctx.app.main_window()
+            import ctypes as _ct
+
+            _user32 = _ct.windll.user32
+            _user32.SendMessageW.argtypes = [
+                _ct.c_void_p, _ct.c_uint, _ct.c_void_p, _ct.c_void_p
+            ]
+            _user32.SendMessageW.restype = _ct.c_void_p
+            edit_texts = []
+            # Rect filter: prefer the Invoice address Tab rect (may resolve
+            # to a TabItem with a narrower rect), else fall back to the whole
+            # Addresses band of the editor.
+            def _inside(r) -> bool:
+                if tab_rect and (
+                    r.left >= tab_rect.left - 40
+                    and r.right <= tab_rect.right + 40
+                    and r.top >= tab_rect.top - 40
+                    and r.bottom <= tab_rect.bottom + 40
+                ):
+                    return True
+                # Addresses band of the editor (Invoice/Delivery rows).
+                return (
+                    r.left >= 300 and r.right <= 1200 and r.top >= 200 and r.bottom <= 500
+                )
+
+            for desc in main.descendants():
+                try:
+                    if (desc.element_info.control_type or "").lower() != "edit":
+                        continue
+                    r = desc.rectangle()
+                    if not _inside(r):
+                        continue
+                    hwnd = desc.element_info.handle
+                    if not hwnd:
+                        continue
+                    length = _user32.SendMessageW(hwnd, 0x000E, 0, 0)
+                    if length <= 0:
+                        continue
+                    buf = _ct.create_string_buffer((int(length) + 1) * 2)
+                    _user32.SendMessageW(hwnd, 0x000D, len(buf), buf)
+                    txt = buf.raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+                    # Only multiline edits inside the band are address fields
+                    # (the single-line Cust.Ref./header edits must be excluded
+                    # so an empty address can never pass verification).
+                    if txt.strip() and ("\r\n" in txt or "\n" in txt):
+                        edit_texts.append(txt.strip())
+                except Exception:
+                    continue
+            if edit_texts:
+                addr_text = " ".join(edit_texts)
+        except Exception:
+            addr_text = ""
+
+        if addr_text.strip():
+            break
+
+        # Method 1: scan main.descendants() for text within the Tab's bounding rect
+        try:
+            main = ctx.app.main_window()
+            texts_in_rect = []
+            for desc in main.descendants():
+                try:
+                    r = desc.rectangle()
+                    # Check if this element is within the Tab's bounding rect
+                    if (tab_rect and
+                            r.left >= tab_rect.left - 5 and
+                            r.right <= tab_rect.right + 5 and
+                            r.top >= tab_rect.top - 5 and
+                            r.bottom <= tab_rect.bottom + 5):
+                        txt = desc.window_text() or ""
+                        if txt.strip() and txt.strip().lower() != "invoice address":
+                            texts_in_rect.append(txt.strip())
+                except Exception:
+                    continue
+            if texts_in_rect:
+                addr_text = " ".join(texts_in_rect)
+        except Exception:
+            addr_text = ""
+
+        # Method 2: fallback to Invoice Tab children (may return empty for SWT)
+        if not addr_text.strip():
+            try:
+                invoice_tab = ctx.find("ADDRESS_ROLE_INVOICE")
+                children_texts = []
+                for child in invoice_tab.children():
+                    txt = child.window_text() or ""
+                    if txt.strip():
+                        children_texts.append(txt.strip())
+                addr_text = " ".join(children_texts)
+            except Exception:
+                pass
+
+        # If address has real content, break
+        if addr_text.strip() and addr_text.strip().lower() not in ("addresses", "invoice address"):
+            break
+
+        logger.info("step2: address not yet populated (attempt %d), retrying...", attempt)
+        time.sleep(0.5)
+
+    if not addr_text.strip() or addr_text.strip().lower() in ("addresses", "invoice address"):
+        raise ManualReviewError(
+            "step2.debtor.verify",
+            f"address area is empty after {label} debtor selection; "
+            f"the keyboard traversal may have failed to select a row",
+        )
+
+    addr = debtor.billing_address
+    expected_fragments = [debtor.company, addr.zip_code, addr.city]
+    missing = [f for f in expected_fragments if f and f.lower() not in addr_text.lower()]
+    if missing:
+        logger.warning(
+            "step2: address verification partial — missing %r in %r", missing, addr_text
+        )
+        # If ALL expected fragments are missing, the address was not populated
+        if len(missing) == len(expected_fragments):
+            raise ManualReviewError(
+                "step2.debtor.verify",
+                f"address area is empty after {label} debtor selection; "
+                f"the keyboard traversal may have failed to select a row",
+            )
+    logger.info("step2: post-selection address verified (%s) for %r", label, debtor.search_key)
+
+
 def _select_or_create(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
     ctx.set_window(order_win)
     _force_render_section(ctx)
@@ -74,6 +229,12 @@ def _select_or_create(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
             stabilize_active_editor(ctx, wait_control="Addresses", max_retries=3)
         except Exception:
             logger.debug("step2: Addresses section not detected after keyboard selection")
+        # POST-SELECTION VERIFICATION: read the populated address content
+        # from the Invoice address Tab (NOT the 'Addresses' header label).
+        # The Tab's children contain the actual address lines (company,
+        # street, ZIP, city).  If the Tab has no children the address is
+        # empty and the keyboard selection silently failed.
+        _verify_address_after_select(ctx, debtor, "keyboard-selected")
         return
 
     rows = table.rows()
@@ -106,6 +267,7 @@ def _reopen_and_select(ctx: FlowContext, order_win, debtor: DebtorData) -> None:
     if table is None:
         logger.info("step2: virtual address table re-selected %r via keyboard traversal", debtor.search_key)
         ctx.set_window(order_win)
+        _verify_address_after_select(ctx, debtor, "keyboard-reselected")
         return
 
     rows = table.rows()
@@ -147,7 +309,18 @@ def _click_debtor_selector(ctx: FlowContext) -> None:
 
 def _click_debtor_selector_once(ctx: FlowContext) -> None:
     """Open the selector through its uniquely scoped UIA semantic role."""
-    Button(ctx.find("DEBTOR_SELECTOR"), ctx.waits).click()
+    el = ctx.find("DEBTOR_SELECTOR")
+    try:
+        logger.info(
+            "step2: debtor selector matched name=%r type=%s rect=%s hwnd=%s",
+            (el.name or "")[:50],
+            getattr(el, "control_type", ""),
+            getattr(el, "rectangle", None),
+            getattr(el, "handle", None),
+        )
+    except Exception:
+        pass
+    Button(el, ctx.waits).click()
 
 
 def _confirm_addresses(ctx: FlowContext, order_win, debtor: DebtorData) -> None:

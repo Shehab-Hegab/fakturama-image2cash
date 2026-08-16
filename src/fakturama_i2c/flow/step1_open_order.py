@@ -12,7 +12,7 @@ from ..models import VatMode
 from ..ui.elements import Button, Combo, Edit
 from ..utils.errors import ControlNotFoundError, ManualReviewError
 from ..utils.logging import get_logger
-from .context import FlowContext, read_text, stabilize_active_editor
+from .context import FlowContext, dismiss_save_parts_dialogs, read_text, stabilize_active_editor
 
 logger = get_logger("flow.step1")
 
@@ -77,35 +77,29 @@ def step_open_new_order(ctx: FlowContext) -> None:
     stabilize_active_editor(ctx, wait_control="Date", max_retries=4)
 
     # Proposed No. is left unchanged (Fakturama assigns the number on save).
-    # Fill with progressive retry: SWT lazy rendering may delay Cust.Ref.
-    for attempt in range(3):
-        try:
-            _fill_date_field(ctx, header.order_date)
-            time.sleep(0.2)
+    # Date and Cust.Ref are non-fatal: if they can't be filled we warn and
+    # continue.  The critical path is opening the editor + setting combos.
+    _fill_date_field(ctx, header.order_date)
+    time.sleep(0.2)
 
-            ref_ctrl = ctx.find("ORDER_REFERENCE")
-            try:
-                ref_ctrl.set_focus()
-            except Exception:
-                pass
-            try:
-                ref_ctrl.click_input()
-            except Exception:
-                pass
-            time.sleep(0.1)
-            ref_ctrl.type_keys("^a{BACKSPACE}")
-            time.sleep(0.1)
-            ref_ctrl.type_keys(header.external_reference, with_spaces=True)
-            time.sleep(0.2)
-            break
-        except (ControlNotFoundError, ManualReviewError):
-            if attempt < 2:
-                logger.info("step1: header fields not yet rendered (attempt %d); forcing render...", attempt + 1)
-                stabilize_active_editor(ctx, wait_control="Date", max_retries=3)
-                _force_render_header(ctx)
-                time.sleep(0.5)
-            else:
-                raise
+    # Fill Cust.Ref — non-fatal if the control isn't rendered yet
+    try:
+        ref_ctrl = ctx.find("ORDER_REFERENCE")
+        try:
+            ref_ctrl.set_focus()
+        except Exception:
+            pass
+        try:
+            ref_ctrl.click_input()
+        except Exception:
+            pass
+        time.sleep(0.1)
+        ref_ctrl.type_keys("^a{BACKSPACE}")
+        time.sleep(0.1)
+        ref_ctrl.type_keys(header.external_reference, with_spaces=True)
+        time.sleep(0.2)
+    except ControlNotFoundError:
+        logger.warning("step1: ORDER_REFERENCE not rendered; skipping cust.ref fill")
 
     Combo(ctx.find("ORDER_PRICE_MODE"), ctx.waits).select(header.price_mode.value)
     _set_vat_mode(ctx, header.vat_mode.value)
@@ -141,11 +135,19 @@ def _fill_date_field(ctx: FlowContext, order_date: object) -> None:
                 label = c
                 break
     if label is None:
-        raise ControlNotFoundError("step1: 'Date' label not found in header band")
-
-    lr = label.rectangle()
-    edit_x = lr.right + 15
-    edit_y = (lr.top + lr.bottom) // 2
+        # Fallback: find the ORDER_DATE control directly (auto_id-based)
+        try:
+            date_ctrl = ctx.find("ORDER_DATE")
+            lr = date_ctrl.rectangle()
+            edit_x = lr.left - 15
+            edit_y = lr.mid_point().y
+            logger.info("step1: 'Date' label not found; using ORDER_DATE ctrl at %s", lr)
+        except Exception:
+            raise ControlNotFoundError("step1: 'Date' label not found in header band")
+    else:
+        lr = label.rectangle()
+        edit_x = lr.right + 15
+        edit_y = (lr.top + lr.bottom) // 2
 
     # Pre-compute all acceptable date strings
     display_date = order_date.strftime("%b %d, %Y")   # "Mar 18, 2026"
@@ -206,24 +208,9 @@ def _fill_date_field(ctx: FlowContext, order_date: object) -> None:
         logger.info("step1: date set to display format: %s", _read_shown())
         return
 
-    # --- Strategy 2: display format with triple-click select-all ---
-    if _try_fill(display_date, "triple_click"):
-        logger.info("step1: date set via triple-click: %s", _read_shown())
-        return
-
-    # --- Strategy 3: ISO format with Ctrl+A ---
-    if _try_fill(iso_date, "ctrl+a"):
-        logger.info("step1: date set to ISO format: %s", _read_shown())
-        return
-
-    # --- Strategy 4: DE format with delete-then-type ---
-    if _try_fill(de_date, "delete"):
+    # --- Strategy 2: DE format (e.g. "18.03.2026") with Ctrl+A ---
+    if _try_fill(de_date, "ctrl+a"):
         logger.info("step1: date set to DE format: %s", _read_shown())
-        return
-
-    # --- Strategy 5: US format with home+shift+end ---
-    if _try_fill(us_date, "home_shift_end"):
-        logger.info("step1: date set to US format: %s", _read_shown())
         return
 
     # All strategies failed — log warning but continue (date is non-fatal)
@@ -280,34 +267,35 @@ def _force_render_header(ctx: FlowContext) -> None:
     """Force SWT to render the full header (Cust.Ref, VAT mode, Addresses, etc).
 
     Eclipse SWT lazily renders form sections until the editor gains focus and
-    the user interacts with it. Click into the first editable field + Tab
-    through the header to trigger lazy render of all header controls.
+    the user interacts with it.  We set focus and use a modest Tab traversal
+    to trigger lazy render — avoiding click_input() on the DateTime picker
+    which can open a calendar popup that steals focus.
     """
     try:
         ctx.window().set_focus()
     except Exception:
         pass
-    time.sleep(0.2)
-    # Click into the Date field directly (the first named editable field)
+    time.sleep(0.3)
+    # Use set_focus (NOT click_input) on Date field to avoid opening calendar popup
     try:
-        date_edit = Edit(ctx.find("ORDER_DATE"), ctx.waits).ctrl
-        date_edit.click_input()  # Click directly into the Date field
+        date_ctrl = ctx.find("ORDER_DATE")
+        date_ctrl.set_focus()
         time.sleep(0.2)
     except Exception:
         pass
-    # Tab through header fields aggressively to trigger lazy render.
-    # Order: Date -> Price Mode -> Cust.Ref -> Consultant -> VAT mode ->
-    # Addresses section -> Items section.
-    for i in range(12):
+    # Tab through header fields to trigger lazy render.
+    # Reduced from 12 to 6 — enough to cover Date, Price Mode, Cust.Ref,
+    # Consultant, VAT mode, and one more. Avoids navigating out of editor.
+    for i in range(6):
         try:
             ctx.window().type_keys("{TAB}")
-            time.sleep(0.2)
+            time.sleep(0.15)
         except Exception:
             break
     # Tab back to Date field
-    for i in range(12):
+    for i in range(6):
         try:
-            ctx.window().type_keys("+{TAB}")  # Shift+Tab
+            ctx.window().type_keys("+{TAB}")
             time.sleep(0.1)
         except Exception:
             break
@@ -332,6 +320,15 @@ def _close_stale_tabs(ctx: FlowContext) -> None:
         return
     # Navigation tabs to keep (left sidebar)
     _KEEP = {"orders", "contacts", "products", "documents", "vats", "fakturama"}
+    # Start-page tab aliases — NEVER ^{F4} these: closing the Fakturama
+    # start page ('Fa') with Ctrl+F4 can take the whole application down.
+    _STARTPAGE = {"fa", "fakturama", "start"}
+    # Clear any stacked 'Save Parts' modal prompts from previous runs first:
+    # they are owned popups that intercept input for the whole flow.
+    try:
+        dismiss_save_parts_dialogs()
+    except Exception:
+        pass
     closed = 0
     for tab in tabs:
         try:
@@ -343,22 +340,23 @@ def _close_stale_tabs(ctx: FlowContext) -> None:
         # Keep navigation sidebar tabs
         if any(k in text for k in _KEEP):
             continue
-        # Keep the currently-being-created New Order tab (step1 will open it)
-        if text.startswith("new order"):
+        # Never close the Fakturama start page.
+        if any(s in text for s in _STARTPAGE):
             continue
+        # Close ANY editor tab, including stale New Order tabs from previous
+        # runs (they accumulate and cause UIA ambiguity). step1 opens a fresh
+        # single New Order editor right after this sweep.
         try:
             tab.set_focus()
             tab.type_keys("^{F4}")  # Ctrl+F4 closes the active tab in Eclipse SWT
             closed += 1
             time.sleep(0.3)
-            # Dismiss any 'Save Parts' dialog that may appear for unsaved docs
+            # Dismiss any 'Save Parts' dialog that may appear for unsaved docs.
+            # Cancel ABORTS the close (the tab stays open) but prevents modal
+            # dialogs from stacking up and swallowing later input.
             try:
-                dlg = main.child_window(title="Save Parts", control_type="Window")
-                if dlg.exists(timeout=0.5):
-                    cancel = dlg.child_window(title_re="(?i)cancel", control_type="Button")
-                    if cancel.exists(timeout=0.5):
-                        cancel.click_input()
-                        time.sleep(0.3)
+                dismiss_save_parts_dialogs()
+                time.sleep(0.3)
             except Exception:
                 pass
         except Exception:
