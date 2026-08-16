@@ -16,7 +16,7 @@ import pywinauto.keyboard
 
 from ..models import PaidStatus, payment_code_for, PaymentCode
 from ..ui.elements import Combo, Edit, Table, format_decimal
-from ..utils.errors import ManualReviewError
+from ..utils.errors import ControlNotFoundError, ManualReviewError
 from ..utils.logging import get_logger
 from ..utils.screenshot import capture_window
 from .context import (
@@ -59,6 +59,7 @@ def step_create_invoice(ctx: FlowContext) -> None:
         ctx.mark("step5.invoice")
         return
 
+    _activate_invoice_editor(ctx)
     invoice_win = ctx.window()
     ctx.mark("step5.invoice")
     _confirm_copied_state(ctx)
@@ -68,6 +69,54 @@ def step_create_invoice(ctx: FlowContext) -> None:
     _save_evidence(ctx, "03_linked_paid_invoice")
     _confirm_persisted(ctx, invoice_win)
     ctx.mark("step5.invoice.done")
+
+
+def _activate_invoice_editor(ctx: FlowContext) -> None:
+    """Activate the CURRENT run's '*New Invoice' editor tab.
+
+    SWT CTabFolder renders only the ACTIVE editor's content into the UIA
+    tree.  step4's follow-up creation TAB-cycles focus through the ORDER
+    editor, which can leave the ORDER tab active; the invoice payment
+    controls ('paid', payment ComboBox) are then invisible and step5 would
+    read the Order's controls (e.g. its 'terms of payment' ComboBox).
+
+    Newest-first heuristic: editors are appended to the end of the tab
+    strip, so the LAST '*New Invoice' tab is the one just created.
+    """
+    import pywinauto
+
+    main = ctx.app.main_window()
+    try:
+        tabs = main.descendants(control_type="TabItem")
+    except Exception as exc:
+        raise ControlNotFoundError("invoice_tab", f"cannot enumerate editor tabs: {exc}") from exc
+    candidates = [
+        t for t in tabs if "new invoice" in (t.window_text() or "").lower()
+    ]
+    if not candidates:
+        raise ControlNotFoundError("invoice_tab", "no '*New Invoice' editor tab found")
+
+    def _paid_visible() -> bool:
+        try:
+            return any(
+                c.element_info.control_type == "CheckBox" and "paid" in (c.window_text() or "").lower()
+                for c in main.descendants()
+            )
+        except Exception:
+            return False
+
+    for tab in reversed(candidates):
+        rect = tab.rectangle()
+        pywinauto.mouse.click(
+            coords=(int((rect.left + rect.right) / 2), int((rect.top + rect.bottom) / 2))
+        )
+        time.sleep(1.0)
+        if _paid_visible():
+            logger.info("step5: activated '*New Invoice' editor tab")
+            return
+    raise ControlNotFoundError(
+        "invoice_tab", "clicked '*New Invoice' tab(s) but 'paid' anchor stayed hidden"
+    )
 
 
 def _confirm_copied_state(ctx: FlowContext) -> None:
@@ -162,7 +211,20 @@ def _select_payment_method(ctx: FlowContext, method: str, mapped: str) -> bool:
             candidates.append(extra)
 
     def _shown() -> str:
+        """Authoritative combo selection via UIA; fall back to window_text.
+
+        window_text() on an SWT ComboBox is often '' (empty), and the empty
+        string is a substring of every candidate — a naive substring check on
+        '' is a false-positive 'success' that silently leaves the default.
+        Prefer the UIA selection value and only fall back to the raw text.
+        """
         try:
+            try:
+                sel = Combo(raw, ctx.waits).value()
+            except Exception:
+                sel = ""
+            if sel:
+                return str(sel)
             return str(raw.window_text() or "")
         except Exception:
             return ""
@@ -184,7 +246,7 @@ def _select_payment_method(ctx: FlowContext, method: str, mapped: str) -> bool:
             _pw.keyboard.send_keys("{ENTER}")
             time.sleep(0.3)
             shown = _shown()
-            if cand.lower() in shown.lower() or shown.lower() in cand.lower():
+            if shown and (cand.lower() in shown.lower() or shown.lower() in cand.lower()):
                 logger.info("step5: payment method selected via type-ahead: %r (shown=%r)", cand, shown)
                 return True
             # Try pressing DOWN once more then ENTER
@@ -194,7 +256,7 @@ def _select_payment_method(ctx: FlowContext, method: str, mapped: str) -> bool:
             _pw.keyboard.send_keys("{ENTER}")
             time.sleep(0.3)
             shown = _shown()
-            if cand.lower() in shown.lower() or shown.lower() in cand.lower():
+            if shown and (cand.lower() in shown.lower() or shown.lower() in cand.lower()):
                 logger.info("step5: payment method selected via type-ahead+DOWN: %r", cand)
                 return True
         except Exception as exc:
@@ -212,7 +274,7 @@ def _select_payment_method(ctx: FlowContext, method: str, mapped: str) -> bool:
                 _pw.keyboard.send_keys("{DOWN}")
                 time.sleep(0.12)
                 shown = _shown()
-                if cand.lower() in shown.lower() or shown.lower() in cand.lower():
+                if shown and (cand.lower() in shown.lower() or shown.lower() in cand.lower()):
                     _pw.keyboard.send_keys("{ENTER}")
                     time.sleep(0.3)
                     logger.info("step5: payment method selected via arrows (attempt %d): %r", arrow_i + 1, cand)
@@ -239,7 +301,7 @@ def _set_paid_status(ctx: FlowContext) -> None:
     try:
         select_combo_value(ctx, "INVOICE_PAID_STATUS", "Paid", "step5.invoice.paid")
         return
-    except ManualReviewError:
+    except (ManualReviewError, ControlNotFoundError):
         pass
     try:
         _Checkbox(ctx.find("INVOICE_PAID_CHECKBOX"), ctx.waits).set_checked(True)
@@ -250,6 +312,114 @@ def _set_paid_status(ctx: FlowContext) -> None:
         ) from exc
 
 
+def _set_payment_date_win32(ctx: FlowContext, de_date: str) -> bool:
+    """Set the payment-date DateTimePicker via DTM_SETSYSTEMTIME (Win32).
+
+    SWT DateTime pickers ignore text typing (the typed value never commits —
+    the field keeps its default, e.g. today's date).  The message-based set is
+    deterministic and verified with a DTM_GETSYSTEMTIME read-back.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class SYSTEMTIME(ctypes.Structure):
+        _fields_ = [
+            ("wYear", wintypes.WORD),
+            ("wMonth", wintypes.WORD),
+            ("wDayOfWeek", wintypes.WORD),
+            ("wDay", wintypes.WORD),
+            ("wHour", wintypes.WORD),
+            ("wMinute", wintypes.WORD),
+            ("wSecond", wintypes.WORD),
+            ("wMilliseconds", wintypes.WORD),
+        ]
+
+    DTM_SETSYSTEMTIME = 0x1002
+    DTM_GETSYSTEMTIME = 0x1003
+    try:
+        y, m, d = [int(p) for p in de_date.split(".")]
+    except Exception:
+        return False
+    user32 = ctypes.windll.user32
+    try:
+        paid_cb = ctx.find("INVOICE_PAID_CHECKBOX")
+        cb_rect = paid_cb.rectangle()
+    except Exception as exc:
+        logger.debug("step5: win32 date set: paid checkbox unavailable: %s", exc)
+        return False
+
+    targets = []
+
+    def _cb(hwnd, _):
+        buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, buf, 64)
+        if buf.value == "SysDateTimePick32":
+            r = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            targets.append((hwnd, r.left, r.top, r.right, r.bottom))
+        return True
+
+    user32.EnumChildWindows(
+        int(ctx.app.main_window().handle),
+        ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(_cb),
+        0,
+    )
+    if not targets:
+        logger.debug("step5: win32 date set: no DateTimePicker exposed")
+        return False
+    # The payment-date picker sits right of the paid checkbox, vertically
+    # aligned with it; pick the closest DateTimePicker by rect distance.
+    cx, cy = cb_rect.right + 260, cb_rect.top + (cb_rect.height() // 2)
+    picker = min(targets, key=lambda t: abs(t[1] - cx) + abs(t[2] - cy))
+    st = SYSTEMTIME(y, m, 0, d, 0, 0, 0, 0)
+    user32.SendMessageW(picker[0], DTM_SETSYSTEMTIME, 0, ctypes.byref(st))
+    time.sleep(0.3)
+    got = SYSTEMTIME()
+    user32.SendMessageW(picker[0], DTM_GETSYSTEMTIME, 0, ctypes.byref(got))
+    if got.wYear == y and got.wMonth == m and got.wDay == d:
+        logger.info("step5: payment date set via Win32 DateTimePicker to %s", de_date)
+        return True
+    logger.warning(
+        "step5: win32 date set did not verify (got %04d-%02d-%02d)",
+        got.wYear, got.wMonth, got.wDay,
+    )
+    return False
+
+
+def _find_date_edit_near_value(ctx: FlowContext):
+    """Locate the unnamed payment-date Edit by its rect relative to the Value Edit.
+
+    Live layout of the paid row (invoice editor): 'paid' CheckBox
+    [338,727,392,747] -> payment-method ComboBox [402,723,512,751] ->
+    payment-date Edit (unnamed) [541,726,645,748] -> Value Edit 'Value'
+    [724,723,789,751].  The date Edit is the unnamed Edit immediately left of
+    the Value Edit on the same row.
+    """
+    try:
+        val = ctx.find("INVOICE_PAYMENT_VALUE")
+        vr = val.rectangle()
+    except Exception:
+        return None
+    best = None
+    try:
+        for ctrl in ctx.app.main_window().descendants():
+            try:
+                if ctrl.element_info.control_type != "Edit":
+                    continue
+                rr = ctrl.rectangle()
+            except Exception:
+                continue
+            if rr.top < vr.top - 30 or rr.bottom > vr.bottom + 30:
+                continue
+            if rr.right > vr.left - 30 or rr.left < vr.left - 400:
+                continue
+            if best is None or rr.right > best[1]:
+                best = (ctrl, rr.right)
+    except Exception:
+        return None
+    return best[0] if best else None
+
+
 def _set_invoice_date_positional(
     ctx: FlowContext, de_date: str, iso_date: str, us_date: str, accepted: tuple
 ) -> None:
@@ -258,6 +428,24 @@ def _set_invoice_date_positional(
     Layout: paid CheckBox(390,646) → ComboBox(454,642) → date Pane(569,637) → value area.
     The date picker is inside Pane rect=[569,637,857,675], center ≈ (713,656).
     """
+    if _set_payment_date_win32(ctx, de_date):
+        return
+    date_edit = _find_date_edit_near_value(ctx)
+    if date_edit is not None:
+        try:
+            date_edit.set_focus()
+            time.sleep(0.15)
+            date_edit.type_keys("^a{BACKSPACE}")
+            time.sleep(0.1)
+            date_edit.type_keys(f"{de_date}{{ENTER}}", pause=0.03)
+            time.sleep(0.4)
+            shown = (Edit(date_edit, ctx.waits).value() or "").replace(" ", "")
+            if any(acc.replace(" ", "") in shown for acc in accepted):
+                logger.info("step5: payment date set (Value-adjacent Edit) as %r", shown)
+                return
+            logger.warning("step5: payment date Edit did not verify (shown=%r)", shown)
+        except Exception as exc:
+            logger.debug("step5: payment date Edit path failed: %s", exc)
     import pywinauto
     main = ctx.app.main_window()
     try:
@@ -277,9 +465,12 @@ def _set_invoice_date_positional(
             date_ctrl.type_keys(f"{candidate}{{ENTER}}", pause=0.03)
             time.sleep(0.3)
             try:
-                shown = (date_ctrl.window_text() or "").replace(" ", "")
+                shown = (Edit(date_ctrl, ctx.waits).value() or "").replace(" ", "")
             except Exception:
-                shown = ""
+                try:
+                    shown = (date_ctrl.window_text() or "").replace(" ", "")
+                except Exception:
+                    shown = ""
             ok = any(acc.replace(" ", "") in shown for acc in accepted)
             if ok:
                 logger.info("step5: payment date accepted (registry) as %r", shown)
@@ -298,7 +489,7 @@ def _set_invoice_date_positional(
         return
 
     cb_rect = paid_cb.rectangle()
-    date_x = cb_rect.right + 280
+    date_x = cb_rect.right + 150
     date_y = cb_rect.top + (cb_rect.height() // 2)
 
     import pywinauto.mouse
@@ -345,7 +536,7 @@ def _set_invoice_value_positional(ctx: FlowContext, gross_str: str) -> None:
 
     import pywinauto.mouse
     cb_rect = paid_cb.rectangle()
-    val_x = cb_rect.right + 420
+    val_x = cb_rect.right + 520
     val_y = cb_rect.top + (cb_rect.height() // 2)
 
     pywinauto.mouse.double_click(coords=(val_x, val_y))
@@ -397,7 +588,8 @@ def _set_payment_fields(ctx: FlowContext) -> None:
     elif payment.paid_status == PaidStatus.DEPOSIT:
         select_combo_value(ctx, "INVOICE_PAID_STATUS", "Deposit", "step5.invoice.paid")
         if payment.payment_date is not None:
-            Edit(ctx.find("INVOICE_PAYMENT_DATE"), ctx.waits).fill(str(payment.payment_date))
+            de_date = payment.payment_date.strftime("%d.%m.%Y")
+            Edit(ctx.find("INVOICE_PAYMENT_DATE"), ctx.waits).fill(de_date)
         logger.info(
             "step5: invoice marked Deposit (date=%s, no value invented)",
             payment.payment_date,

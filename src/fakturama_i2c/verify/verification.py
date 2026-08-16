@@ -416,9 +416,16 @@ class Verifier:
             except Exception:
                 continue
         try:
-            return str(ctrl.window_text() or "").strip()
+            text = str(ctrl.window_text() or "").strip()
         except Exception:
-            return ""
+            return None
+        # SWT labels share the value control's name (e.g. the 'Payment date'
+        # label is returned instead of the picker). A label value is not a
+        # field value: treat it as not exposed (honest SKIP) rather than
+        # failing a comparison against it.
+        if text and not any(ch.isdigit() for ch in text):
+            return None
+        return text or None
 
     def _read_payment_method(self, window: Any) -> Optional[str]:
         """Read the payment-method ComboBox value.

@@ -1,0 +1,6 @@
+dialog_title='Select a product'
+win=<uiawrapper.UIAWrapper - '', Pane, -6715364292235014645>
+win.class_name()=''
+search_edit.handle=4657168
+
+--- win.descendants() ---

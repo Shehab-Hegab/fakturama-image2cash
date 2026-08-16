@@ -79,7 +79,10 @@ def step_open_new_order(ctx: FlowContext) -> None:
     # Proposed No. is left unchanged (Fakturama assigns the number on save).
     # Date and Cust.Ref are non-fatal: if they can't be filled we warn and
     # continue.  The critical path is opening the editor + setting combos.
-    _fill_date_field(ctx, header.order_date)
+    try:
+        _fill_date_field(ctx, header.order_date)
+    except ControlNotFoundError:
+        logger.warning("step1: date field not rendered; skipping date fill")
     time.sleep(0.2)
 
     # Fill Cust.Ref — non-fatal if the control isn't rendered yet
@@ -322,7 +325,9 @@ def _close_stale_tabs(ctx: FlowContext) -> None:
     _KEEP = {"orders", "contacts", "products", "documents", "vats", "fakturama"}
     # Start-page tab aliases — NEVER ^{F4} these: closing the Fakturama
     # start page ('Fa') with Ctrl+F4 can take the whole application down.
-    _STARTPAGE = {"fa", "fakturama", "start"}
+    # NOTE: 'fa' alone is too broad (any 'FA-2026-...' invoice tab contains
+    # it); 'fakturama' + 'start' cover the start page exactly.
+    _STARTPAGE = {"fakturama", "start"}
     # Clear any stacked 'Save Parts' modal prompts from previous runs first:
     # they are owned popups that intercept input for the whole flow.
     try:

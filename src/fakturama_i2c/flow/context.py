@@ -272,7 +272,8 @@ class FlowContext:
                 if length <= 0:
                     return ""
                 buf = _ctypes.create_string_buffer((int(length) + 1) * 2)
-                _ctypes.windll.user32.SendMessageW(hwnd, WM_GETTEXT, len(buf), buf)
+                # WM_GETTEXT's nMaxCount is a CHARACTER count, not bytes.
+                _ctypes.windll.user32.SendMessageW(hwnd, WM_GETTEXT, len(buf) // 2, buf)
                 return buf.raw.decode("utf-16-le", errors="replace").rstrip("\x00")
             except Exception:
                 return ""
@@ -1056,7 +1057,8 @@ def _dismiss_owned_dialog_titles(titles: tuple[str, ...], max_rounds: int = 3) -
                     user32.ShowWindow(hwnd, 9)  # SW_RESTORE
                     user32.SetForegroundWindow(hwnd)
                     time.sleep(0.4)
-                    pywinauto.keyboard.send_keys("{ESC}")
+                    import pywinauto.keyboard as _kb
+                    _kb.send_keys("{ESC}")
                     time.sleep(0.5)
                 except Exception:
                     continue
@@ -1330,5 +1332,16 @@ def candidate_doc_rows(
 ) -> list[list[str]]:
     """Rows belonging to the saved document pair, keyed by Cust.Ref or date+total."""
     if reference:
-        return [r for r in rows if row_has_exact(r, reference)]
+        matched = [r for r in rows if row_has_exact(r, reference)]
+        # The ref is the primary key, but a saved doc whose date disagrees
+        # with the extraction is a red flag (e.g. the date fill silently
+        # failed). Warn when the unique ref row does not carry the date; the
+        # date column may simply be absent from the UIA row dump, so this is
+        # a warning, not a hard failure.
+        if len(matched) == 1 and not doc_date_ok(matched[0], order_date):
+            logger.warning(
+                "candidate_doc_rows: ref-matched row does not show the extracted "
+                "date %s (date column may be UIA-hidden)", order_date.isoformat(),
+            )
+        return matched
     return [r for r in rows if doc_date_ok(r, order_date) and doc_total_ok(r, total)]

@@ -126,7 +126,15 @@ class Combo(Control):
         try:
             return str(self.ctrl.selected_text() or "")
         except Exception:
-            return self.items()[0] if self.items() else ""
+            pass
+        # window_text() may expose the committed selection for SWT combos;
+        # items()[0] is the FIRST LIST ITEM, not the selection — only use it
+        # as a last resort.
+        try:
+            return str(self.ctrl.window_text() or "")
+        except Exception:
+            pass
+        return self.items()[0] if self.items() else ""
 
     def select(self, text: str) -> None:
         """Select combo item via resilient keyboard navigation (SWT-safe).

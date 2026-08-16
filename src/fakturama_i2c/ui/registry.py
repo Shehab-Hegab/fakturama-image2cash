@@ -329,7 +329,7 @@ def default_registry() -> dict[str, Role]:
         ),
         "ORDER_TOTAL_NET": Role("ORDER_TOTAL_NET").add(
             Strategy("auto_id", "4065694"),
-        ).add(Strategy("name", "Total Gross", regex=True)).add(Strategy("name", "Total Net", regex=True)),
+        ).add(Strategy("name", "Total Net", regex=True)).add(Strategy("name", "Total Gross", regex=True)),
         # Totals VAT: prefer a strict 'Total VAT'-style label (avoids matching
         # the 5+ line-table 'VAT' header cells); keep auto_id + Edit fallbacks.
         "ORDER_TOTAL_VAT": Role("ORDER_TOTAL_VAT").add(
@@ -346,10 +346,16 @@ def default_registry() -> dict[str, Role]:
         # -- Invoice editor ----------------------------------------------------
         # The payment-method ComboBox has NO name in many Fakturama builds;
         # we fall back to a positional strategy below.
+        # NOTE: no bare `control_type=ComboBox` fallback here — it would match
+        # the FIRST ComboBox in the window (the price-mode combo), which is
+        # wrong.  step5_invoice._find_payment_combo anchors on the 'paid'
+        # checkbox instead when this role cannot resolve.
         "INVOICE_PAYMENT_METHOD": Role("INVOICE_PAYMENT_METHOD").add(
             Strategy("name", "Payment", regex=True),
-        ).add(Strategy("control_type", "ComboBox", require_unique=False)),
+        ),
         "INVOICE_PAID_STATUS": Role("INVOICE_PAID_STATUS").add(
+            Strategy("control_type", "ComboBox", name_filter="paid"),
+        ).add(
             Strategy("control_type", "CheckBox", name_filter="paid"),
         ).add(
             Strategy("name", r"(?i)^paid$", regex=True),
@@ -360,6 +366,8 @@ def default_registry() -> dict[str, Role]:
             Strategy("control_type", "Button", name_filter="paid"),
         ).add(Strategy("name", r"(?i).*paid.*", regex=True)),
         "INVOICE_PAYMENT_DATE": Role("INVOICE_PAYMENT_DATE").add(
+            Strategy("control_type", "Edit", name_filter="Payment date", require_unique=False),
+        ).add(
             Strategy("name", "Payment date", regex=True),
         ).add(Strategy("name", r"(?i)^payment\s+date$", regex=True)),
         "INVOICE_PAYMENT_DATE_LABEL": Role("INVOICE_PAYMENT_DATE_LABEL").add(
